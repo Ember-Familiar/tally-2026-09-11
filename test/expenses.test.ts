@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import Database from 'better-sqlite3';
 import { createApp } from '../src/app';
@@ -10,9 +10,9 @@ import {
   isValidDate,
   calculateEqualSplits,
   ValidationError,
-  Member,
   Expense,
   ExpenseSplit,
+  Member,
 } from '../src/routes/groups';
 
 describe('Expense Routes - POST /groups/:id/expenses', () => {
@@ -22,6 +22,10 @@ describe('Expense Routes - POST /groups/:id/expenses', () => {
   beforeEach(() => {
     db = createDatabase(':memory:');
     app = createApp(db);
+  });
+
+  afterEach(() => {
+    db.close();
   });
 
   describe('Pure helper unit tests', () => {
@@ -844,7 +848,7 @@ describe('Expense Routes - POST /groups/:id/expenses', () => {
       expect(returnedIds).toEqual([exp3.body.id, exp2.body.id, exp1.body.id]);
     });
 
-    it('isolates expenses and splits by group so groups do not leak into each other', async () => {
+    it('isolates expenses by group so groups do not leak into each other', async () => {
       const otherGroupRes = await request(app)
         .post('/groups')
         .send({ name: 'Other Group', members: ['Dave', 'Eve'] });
@@ -868,9 +872,6 @@ describe('Expense Routes - POST /groups/:id/expenses', () => {
       expect(g2Res.body).toHaveLength(1);
       expect(g1Res.body[0].group_id).toBe(groupId);
       expect(g1Res.body[0].description).toBe('Group 1 Expense');
-      expect(g1Res.body[0].splits).toHaveLength(3);
-      expect(g1Res.body[0].splits.reduce((acc: number, s: ExpenseSplit) => acc + s.amount, 0)).toBe(1500);
-
       expect(g2Res.body[0].group_id).toBe(otherGroupId);
       expect(g2Res.body[0].description).toBe('Group 2 Expense');
       expect(g2Res.body[0].splits).toHaveLength(2);
@@ -878,7 +879,7 @@ describe('Expense Routes - POST /groups/:id/expenses', () => {
       expect(g2Res.body[0].splits.map((s: ExpenseSplit) => s.user_name).sort()).toEqual(['Dave', 'Eve']);
     });
 
-    it('correctly associates splits across many expenses without per-expense queries', async () => {
+    it('correctly associates splits across many expenses without N+1 query loop', async () => {
       for (let i = 1; i <= 5; i++) {
         await request(app)
           .post(`/groups/${groupId}/expenses`)
@@ -903,6 +904,1028 @@ describe('Expense Routes - POST /groups/:id/expenses', () => {
           expect(['Alice', 'Bob', 'Charlie']).toContain(s.user_name);
         }
       }
+    });
+  });
+});
+
+describe('Task 9 - POST /groups/:id/expenses with unequal and custom splits', () => {
+  let db: Database.Database;
+  let app: ReturnType<typeof createApp>;
+  let groupId: number;
+  let aliceId: number;
+  let bobId: number;
+  let charlieId: number;
+
+  beforeEach(async () => {
+    db = createDatabase(':memory:');
+    app = createApp(db);
+
+    const groupRes = await request(app)
+      .post('/groups')
+      .send({
+        name: 'Weekend Trip',
+        members: ['Alice', 'Bob', 'Charlie'],
+      });
+    groupId = groupRes.body.id;
+    const members = groupRes.body.members as Member[];
+    aliceId = members.find((m) => m.name === 'Alice')!.id;
+    bobId = members.find((m) => m.name === 'Bob')!.id;
+    charlieId = members.find((m) => m.name === 'Charlie')!.id;
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  describe('Explicit amount splits', () => {
+    it('creates expense with explicit integer-cent splits in array format across a subset of members', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          description: 'Dinner for two',
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 4000 },
+            { user_id: bobId, amount: 2000 },
+          ],
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({
+        id: 1,
+        group_id: groupId,
+        paid_by: aliceId,
+        amount: 6000,
+        description: 'Dinner for two',
+      });
+      expect(res.body.splits).toHaveLength(2);
+      expect(res.body.splits[0]).toMatchObject({
+        user_id: aliceId,
+        user_name: 'Alice',
+        amount: 4000,
+      });
+      expect(res.body.splits[1]).toMatchObject({
+        user_id: bobId,
+        user_name: 'Bob',
+        amount: 2000,
+      });
+
+      // Verify DB persistence
+      const splitsInDb = db.prepare('SELECT * FROM expense_splits WHERE expense_id = 1 ORDER BY user_id ASC').all() as {
+        user_id: number;
+        amount: number;
+      }[];
+      expect(splitsInDb).toEqual([
+        expect.objectContaining({ user_id: aliceId, amount: 4000 }),
+        expect.objectContaining({ user_id: bobId, amount: 2000 }),
+      ]);
+    });
+
+    it('accepts split participant aliases (user, userId, member, member_id, id, name)', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          description: 'Aliases test',
+          paid_by: aliceId,
+          splits: [
+            { userId: aliceId, amount: 2000 },
+            { member: 'Bob', amount: 2000 },
+            { name: 'Charlie', amount: 2000 },
+          ],
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(3);
+      expect(res.body.splits[0].amount).toBe(2000);
+      expect(res.body.splits[1].amount).toBe(2000);
+      expect(res.body.splits[2].amount).toBe(2000);
+    });
+
+    it('creates expense with explicit amounts in object format (ID and name keys)', async () => {
+      const res1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 5000,
+          description: 'Object with IDs',
+          paid_by: bobId,
+          splits: {
+            [aliceId]: 3000,
+            [bobId]: 2000,
+          },
+        });
+
+      expect(res1.status).toBe(201);
+      expect(res1.body.splits).toHaveLength(2);
+      expect(res1.body.splits[0].amount).toBe(3000);
+      expect(res1.body.splits[1].amount).toBe(2000);
+
+      const res2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 3000,
+          description: 'Object with names and split_amounts field',
+          paid_by: charlieId,
+          split_amounts: {
+            Alice: 1000,
+            Bob: 2000,
+          },
+        });
+
+      expect(res2.status).toBe(201);
+      expect(res2.body.splits).toHaveLength(2);
+    });
+
+    it('accepts split_type: exact with splits array', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          description: 'Explicit exact split_type',
+          paid_by: aliceId,
+          split_type: 'exact',
+          splits: [
+            { user_id: aliceId, amount: 4000 },
+            { user_id: charlieId, amount: 2000 },
+          ],
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(2);
+    });
+  });
+
+  describe('Ratio and share splits', () => {
+    it('creates expense with ratio splits in array format and pins largest remainder determinism', async () => {
+      // 1000 cents with 1:2:3 ratios -> [167, 333, 500]
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          description: 'Ratio splits array',
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, ratio: 1 },
+            { user_id: bobId, ratio: 2 },
+            { user_id: charlieId, ratio: 3 },
+          ],
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(3);
+      expect(res.body.splits[0]).toMatchObject({ user_id: aliceId, amount: 167 });
+      expect(res.body.splits[1]).toMatchObject({ user_id: bobId, amount: 333 });
+      expect(res.body.splits[2]).toMatchObject({ user_id: charlieId, amount: 500 });
+      expect(res.body.splits.reduce((sum: number, s: ExpenseSplit) => sum + s.amount, 0)).toBe(1000);
+    });
+
+    it('pins tiebreaking determinism by user_id ASC for equal ratio remainders', async () => {
+      // 101 cents with 1:1 ratio between alice and bob
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 101,
+          description: 'Ratio tiebreak',
+          paid_by: aliceId,
+          shares: {
+            [bobId]: 1,
+            [aliceId]: 1,
+          },
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(2);
+      expect(res.body.splits[0]).toMatchObject({ user_id: aliceId, amount: 51 });
+      expect(res.body.splits[1]).toMatchObject({ user_id: bobId, amount: 50 });
+      expect(res.body.splits.reduce((sum: number, s: ExpenseSplit) => sum + s.amount, 0)).toBe(101);
+    });
+
+    it('accepts split_type: ratio / shares with ratios object', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 3000,
+          description: 'Ratio split_type with ratios field',
+          paid_by: bobId,
+          split_type: 'ratio',
+          ratios: {
+            Alice: 2,
+            Bob: 1,
+          },
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(2);
+      expect(res.body.splits[0]).toMatchObject({ user_id: aliceId, amount: 2000 });
+      expect(res.body.splits[1]).toMatchObject({ user_id: bobId, amount: 1000 });
+    });
+  });
+
+  describe('Percentage splits', () => {
+    it('creates expense with percentage splits in array format', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 5000,
+          description: 'Percentage splits array',
+          paid_by: aliceId,
+          percentages: {
+            [aliceId]: 60,
+            [bobId]: 40,
+          },
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(2);
+      expect(res.body.splits[0]).toMatchObject({ user_id: aliceId, amount: 3000 });
+      expect(res.body.splits[1]).toMatchObject({ user_id: bobId, amount: 2000 });
+    });
+
+    it('pins largest remainder determinism for decimal percentages (33.33 / 33.33 / 33.34)', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          description: 'Decimal percentages',
+          paid_by: charlieId,
+          split_type: 'percentage',
+          splits: [
+            { user_id: aliceId, percentage: 33.33 },
+            { user_id: bobId, percentage: 33.33 },
+            { user_id: charlieId, percentage: 33.34 },
+          ],
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(3);
+      expect(res.body.splits[0]).toMatchObject({ user_id: aliceId, amount: 333 });
+      expect(res.body.splits[1]).toMatchObject({ user_id: bobId, amount: 333 });
+      expect(res.body.splits[2]).toMatchObject({ user_id: charlieId, amount: 334 });
+      expect(res.body.splits.reduce((sum: number, s: ExpenseSplit) => sum + s.amount, 0)).toBe(1000);
+    });
+  });
+
+  describe('Equal split with subset of members', () => {
+    it('creates equal split among a subset of members via primitive IDs array', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          description: 'Subset equal split',
+          paid_by: aliceId,
+          splits: [aliceId, charlieId],
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(2);
+      expect(res.body.splits[0]).toMatchObject({ user_id: aliceId, amount: 500 });
+      expect(res.body.splits[1]).toMatchObject({ user_id: charlieId, amount: 500 });
+    });
+
+    it('accepts split_type: equal with no splits (defaults to all group members)', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 3000,
+          description: 'Explicit equal split type',
+          paid_by: aliceId,
+          split_type: 'equal',
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(3);
+    });
+
+    it('creates equal split among a subset of members via object array with participant aliases only', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          description: 'Subset equal split with objects',
+          paid_by: aliceId,
+          splits: [{ userId: aliceId }, { userId: charlieId }],
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.splits).toHaveLength(2);
+      expect(res.body.splits[0]).toMatchObject({ user_id: aliceId, amount: 500 });
+      expect(res.body.splits[1]).toMatchObject({ user_id: charlieId, amount: 500 });
+    });
+  });
+
+  describe('Validation and 400 Bad Request error responses', () => {
+    it('rejects explicit split amounts that do not sum to total', async () => {
+      // sum < total
+      const res1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          description: 'Under-split',
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 3000 },
+            { user_id: bobId, amount: 2000 },
+          ],
+        });
+      expect(res1.status).toBe(400);
+      expect(res1.body.error).toMatch(/does not equal total amount/);
+
+      // sum > total
+      const res2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          description: 'Over-split',
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 4000 },
+            { user_id: bobId, amount: 3000 },
+          ],
+        });
+      expect(res2.status).toBe(400);
+      expect(res2.body.error).toMatch(/does not equal total amount/);
+    });
+
+    it('rejects participants who are not members of the group', async () => {
+      // Non-member by ID
+      const res1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 3000 },
+            { user_id: 9999, amount: 3000 },
+          ],
+        });
+      expect(res1.status).toBe(400);
+      expect(res1.body.error).toBe('Participant must be a member of the group');
+
+      // Non-member by name
+      const res2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: {
+            Alice: 3000,
+            NonExistent: 3000,
+          },
+        });
+      expect(res2.status).toBe(400);
+      expect(res2.body.error).toBe('Participant must be a member of the group');
+
+      // Member of another group
+      const otherGroupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Other Group', members: ['Dave'] });
+      const daveId = (otherGroupRes.body.members as Member[]).find((m) => m.name === 'Dave')!.id;
+
+      const res3 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 3000 },
+            { user_id: daveId, amount: 3000 },
+          ],
+        });
+      expect(res3.status).toBe(400);
+      expect(res3.body.error).toBe('Participant must be a member of the group');
+    });
+
+    it('rejects duplicate participants in splits', async () => {
+      const res1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 3000 },
+            { user_id: aliceId, amount: 3000 },
+          ],
+        });
+      expect(res1.status).toBe(400);
+      expect(res1.body.error).toBe('Duplicate participant in splits');
+
+      const res2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: {
+            Alice: 3000,
+            alice: 3000,
+          },
+        });
+      expect(res2.status).toBe(400);
+      expect(res2.body.error).toBe('Duplicate participant in splits');
+    });
+
+    it('rejects empty split sets across all formats', async () => {
+      const res1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 6000, paid_by: aliceId, splits: [] });
+      expect(res1.status).toBe(400);
+      expect(res1.body.error).toBe('Splits list cannot be empty');
+
+      const res2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 6000, paid_by: aliceId, splits: {} });
+      expect(res2.status).toBe(400);
+      expect(res2.body.error).toBe('Splits list cannot be empty');
+
+      const res3 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 6000, paid_by: aliceId, shares: {} });
+      expect(res3.status).toBe(400);
+      expect(res3.body.error).toBe('Splits list cannot be empty');
+
+      const res4 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 6000, paid_by: aliceId, percentages: [] });
+      expect(res4.status).toBe(400);
+      expect(res4.body.error).toBe('Splits list cannot be empty');
+    });
+
+    it('rejects non-positive, non-integer, and unsafe split amounts', async () => {
+      const res0 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 0 },
+            { user_id: bobId, amount: 6000 },
+          ],
+        });
+      expect(res0.status).toBe(400);
+      expect(res0.body.error).toBe('Split amount must be a positive integer in cents');
+
+      const resNeg = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: -1000 },
+            { user_id: bobId, amount: 7000 },
+          ],
+        });
+      expect(resNeg.status).toBe(400);
+      expect(resNeg.body.error).toBe('Split amount must be a positive integer in cents');
+
+      const resFloat = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 3000.5 },
+            { user_id: bobId, amount: 2999.5 },
+          ],
+        });
+      expect(resFloat.status).toBe(400);
+      expect(resFloat.body.error).toBe('Split amount must be a positive integer in cents');
+
+      const resStr = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: '3000' },
+            { user_id: bobId, amount: 3000 },
+          ],
+        });
+      expect(resStr.status).toBe(400);
+      expect(resStr.body.error).toBe('Split amount must be a positive integer in cents');
+    });
+
+    it('rejects negative or zero ratios', async () => {
+      const resZero = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          shares: { [aliceId]: 0, [bobId]: 1 },
+        });
+      expect(resZero.status).toBe(400);
+      expect(resZero.body.error).toBe('Split ratio must be a positive number');
+
+      const resNeg = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          shares: { [aliceId]: -2, [bobId]: 1 },
+        });
+      expect(resNeg.status).toBe(400);
+      expect(resNeg.body.error).toBe('Split ratio must be a positive number');
+    });
+
+    it('rejects percentages that do not total 100', async () => {
+      const res90 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          percentages: { [aliceId]: 50, [bobId]: 40 },
+        });
+      expect(res90.status).toBe(400);
+      expect(res90.body.error).toBe('Split percentages must sum to 100');
+
+      const res110 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          percentages: { [aliceId]: 60, [bobId]: 50 },
+        });
+      expect(res110.status).toBe(400);
+      expect(res110.body.error).toBe('Split percentages must sum to 100');
+
+      // Decimal proportions (0.5 + 0.5 = 1.0) must NOT be accepted as 100%
+      const resProp = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          percentages: { [aliceId]: 0.5, [bobId]: 0.5 },
+        });
+      expect(resProp.status).toBe(400);
+      expect(resProp.body.error).toBe('Split percentages must sum to 100');
+
+      // Zero or negative percentage
+      const resZero = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          percentages: { [aliceId]: 0, [bobId]: 100 },
+        });
+      expect(resZero.status).toBe(400);
+      expect(resZero.body.error).toBe('Split percentage must be positive');
+    });
+
+    it('rejects ambiguous or mixed split specifications', async () => {
+      // Multiple split properties in body
+      const resMulti = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [{ user_id: aliceId, amount: 6000 }],
+          shares: { [aliceId]: 1 },
+        });
+      expect(resMulti.status).toBe(400);
+      expect(resMulti.body.error).toBe('Ambiguous split specification: multiple split properties provided');
+
+      // Ambiguous item with multiple types
+      const resItem = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [{ user_id: aliceId, amount: 6000, ratio: 1 }],
+        });
+      expect(resItem.status).toBe(400);
+      expect(resItem.body.error).toBe('Ambiguous split specification in split item');
+
+      // Ambiguous item with intra-family conflict (ratio vs shares)
+      const resRatioShares = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, ratio: 1, shares: 99 },
+            { user_id: bobId, ratio: 1 },
+          ],
+        });
+      expect(resRatioShares.status).toBe(400);
+      expect(resRatioShares.body.error).toBe('Ambiguous split specification in split item');
+
+      // Ambiguous item with intra-family conflict (amount vs split_amount)
+      const resAmtSplitAmt = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 4000, split_amount: 999 },
+            { user_id: bobId, amount: 2000 },
+          ],
+        });
+      expect(resAmtSplitAmt.status).toBe(400);
+      expect(resAmtSplitAmt.body.error).toBe('Ambiguous split specification in split item');
+
+      // Ambiguous item with intra-family conflict (percentage vs pct)
+      const resPctConflict = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, percentage: 50, pct: 99 },
+            { user_id: bobId, percentage: 50 },
+          ],
+        });
+      expect(resPctConflict.status).toBe(400);
+      expect(resPctConflict.body.error).toBe('Ambiguous split specification in split item');
+
+      // Ambiguous item with intra-family conflict (shares vs weight)
+      const resSharesWeight = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, shares: 1, weight: 2 },
+            { user_id: bobId, shares: 1 },
+          ],
+        });
+      expect(resSharesWeight.status).toBe(400);
+      expect(resSharesWeight.body.error).toBe('Ambiguous split specification in split item');
+
+      // Ambiguous item with intra-family conflict (percent vs pct)
+      const resPercentPct = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, percent: 50, pct: 50 },
+            { user_id: bobId, percent: 50 },
+          ],
+        });
+      expect(resPercentPct.status).toBe(400);
+      expect(resPercentPct.body.error).toBe('Ambiguous split specification in split item');
+
+      // Unrecognized or misspelled split item properties
+      // Misspelled ratios (plural of ratio)
+      const resRatios = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          splits: [
+            { userId: aliceId, ratios: 3 },
+            { userId: bobId, ratios: 1 },
+          ],
+        });
+      expect(resRatios.status).toBe(400);
+      expect(resRatios.body.error).toBe("Unknown property 'ratios' in split item");
+
+      // Misspelled share (singular of shares)
+      const resShare = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          splits: [
+            { userId: aliceId, share: 3 },
+            { userId: bobId, share: 1 },
+          ],
+        });
+      expect(resShare.status).toBe(400);
+      expect(resShare.body.error).toBe("Unknown property 'share' in split item");
+
+      // Misspelled percentages (plural of percentage)
+      const resPercentages = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          splits: [
+            { userId: aliceId, percentages: 75 },
+            { userId: bobId, percentages: 25 },
+          ],
+        });
+      expect(resPercentages.status).toBe(400);
+      expect(resPercentages.body.error).toBe("Unknown property 'percentages' in split item");
+
+      // Misspelled amounts (plural of amount)
+      const resAmounts = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          splits: [
+            { userId: aliceId, amounts: 700 },
+            { userId: bobId, amounts: 300 },
+          ],
+        });
+      expect(resAmounts.status).toBe(400);
+      expect(resAmounts.body.error).toBe("Unknown property 'amounts' in split item");
+
+      // Mixed items (amount and ratio)
+      const resMixed = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: [
+            { user_id: aliceId, amount: 4000 },
+            { user_id: bobId, ratio: 1 },
+          ],
+        });
+      expect(resMixed.status).toBe(400);
+      expect(resMixed.body.error).toBe('Mixed split specification: cannot mix amounts, ratios, and percentages');
+
+      // Conflict between split_type and split items
+      const resConflict = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          split_type: 'ratio',
+          splits: [{ user_id: aliceId, amount: 6000 }],
+        });
+      expect(resConflict.status).toBe(400);
+      expect(resConflict.body.error).toBe('Invalid split specification: expected ratios/shares');
+
+      // split_type requiring definition with no definition
+      const resNoDef = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          split_type: 'exact',
+        });
+      expect(resNoDef.status).toBe(400);
+      expect(resNoDef.body.error).toBe("Splits definition is required for split type 'exact'");
+
+      // Unsupported split_type
+      const resBadType = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          split_type: 'custom_magic',
+        });
+      expect(resBadType.status).toBe(400);
+      expect(resBadType.body.error).toBe('Unsupported split_type: custom_magic');
+
+      // Non-string split_type
+      const resNumType = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          split_type: 123,
+        });
+      expect(resNumType.status).toBe(400);
+      expect(resNumType.body.error).toBe('split_type must be a string');
+
+      // Non-array / non-object splits
+      const resNullSplits = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: null,
+        });
+      expect(resNullSplits.status).toBe(400);
+      expect(resNullSplits.body.error).toBe('Splits must be an array or object');
+
+      const resStrSplits = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          splits: 'all',
+        });
+      expect(resStrSplits.status).toBe(400);
+      expect(resStrSplits.body.error).toBe('Splits must be an array or object');
+    });
+
+    it('rejects top-level ratio split property with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          ratio: { [aliceId]: 3, [bobId]: 1 },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'ratio' at top level");
+    });
+
+    it('rejects top-level share split property with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          share: { [aliceId]: 3, [bobId]: 1 },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'share' at top level");
+    });
+
+    it('rejects top-level weight split property with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          weight: { [aliceId]: 3, [bobId]: 1 },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'weight' at top level");
+    });
+
+    it('rejects top-level percentage split property with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          percentage: { [aliceId]: 75, [bobId]: 25 },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'percentage' at top level");
+    });
+
+    it('rejects top-level percent split property with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          percent: { [aliceId]: 75, [bobId]: 25 },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'percent' at top level");
+    });
+
+    it('rejects top-level pct split property with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          pct: { [aliceId]: 75, [bobId]: 25 },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'pct' at top level");
+    });
+
+    it('rejects top-level split_amount split property with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          split_amount: { [aliceId]: 700, [bobId]: 300 },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'split_amount' at top level");
+    });
+
+    it('allows benign unrelated top-level keys to pass through with equal split', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          notes: 'Dinner with team',
+          currency: 'USD',
+          category: 'Dining',
+          receipt_url: 'https://example.com/receipt.jpg',
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.amount).toBe(6000);
+      expect(res.body.splits).toHaveLength(3);
+      expect(res.body.splits.map((s: { amount: number }) => s.amount)).toEqual([2000, 2000, 2000]);
+    });
+
+    it('rejects ratio that overflows scaled multiplication with 400 instead of 500', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          description: 'Overflow ratio test',
+          splits: [
+            { user_id: aliceId, ratio: 0.5 },
+            { user_id: bobId, ratio: 1e308 },
+          ],
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('Split ratio exceeds maximum allowable value');
+    });
+
+    it('rejects split percentage that rounds to 0 weight inside sum tolerance with 400', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          description: 'Tiny percentage test',
+          percentages: {
+            [aliceId]: 100,
+            [bobId]: 1e-7,
+          },
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('Split percentage must be positive');
+    });
+
+    it('rejects disallowed top-level split properties even when valid split property is provided', async () => {
+      const res = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          paid_by: aliceId,
+          ratios: { [aliceId]: 1, [bobId]: 1 },
+          ratio: 99,
+        });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Unrecognized split property 'ratio' at top level");
+    });
+  });
+
+  describe('Integration with balances and settlement flow', () => {
+    it('propagates custom splits to GET /groups/:id/balances, preserves total_spend and nets to zero', async () => {
+      // Expense 1: Alice pays 6000, split 4000 Alice, 2000 Bob (Charlie not in split)
+      await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          paid_by: aliceId,
+          description: 'Dinner',
+          splits: [
+            { user_id: aliceId, amount: 4000 },
+            { user_id: bobId, amount: 2000 },
+          ],
+        });
+
+      // Expense 2: Bob pays 3000, shares 2 Bob : 1 Charlie (Alice not in split)
+      await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 3000,
+          paid_by: bobId,
+          description: 'Drinks',
+          shares: {
+            [bobId]: 2,
+            [charlieId]: 1,
+          },
+        });
+
+      // Balances check
+      const balRes = await request(app).get(`/groups/${groupId}/balances`);
+      expect(balRes.status).toBe(200);
+
+      // Total spend = 6000 + 3000 = 9000
+      expect(balRes.body.total_spend).toBe(9000);
+
+      // Alice: paid 6000, owed 4000 -> net +2000
+      // Bob: paid 3000, owed 2000 + 2000 = 4000 -> net -1000
+      // Charlie: paid 0, owed 1000 -> net -1000
+      const balances = balRes.body.balances;
+      const aliceBal = balances.find((b: { user_id: number }) => b.user_id === aliceId);
+      const bobBal = balances.find((b: { user_id: number }) => b.user_id === bobId);
+      const charlieBal = balances.find((b: { user_id: number }) => b.user_id === charlieId);
+
+      expect(aliceBal).toMatchObject({ paid: 6000, owed: 4000, net_balance: 2000 });
+      expect(bobBal).toMatchObject({ paid: 3000, owed: 4000, net_balance: -1000 });
+      expect(charlieBal).toMatchObject({ paid: 0, owed: 1000, net_balance: -1000 });
+
+      // Zero-sum conservation
+      const netSum = balances.reduce((sum: number, b: { net_balance: number }) => sum + b.net_balance, 0);
+      expect(netSum).toBe(0);
+
+      // Settle Bob -> Alice (1000) and Charlie -> Alice (1000)
+      const settleBob = await request(app)
+        .post(`/groups/${groupId}/settle`)
+        .send({
+          from: bobId,
+          to: aliceId,
+          amount: 1000,
+        });
+      expect(settleBob.status).toBe(201);
+
+      const settleCharlie = await request(app)
+        .post(`/groups/${groupId}/settle`)
+        .send({
+          from: charlieId,
+          to: aliceId,
+          amount: 1000,
+        });
+      expect(settleCharlie.status).toBe(201);
+
+      // All net balances should now be zero
+      const afterSettleRes = await request(app).get(`/groups/${groupId}/balances`);
+      expect(afterSettleRes.status).toBe(200);
+      for (const b of afterSettleRes.body.balances) {
+        expect(b.net_balance).toBe(0);
+      }
+      expect(afterSettleRes.body.settlements).toEqual([]);
     });
   });
 });

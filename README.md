@@ -121,34 +121,97 @@ Returns a single group with its members by group ID.
 
 ### Expenses
 
-#### `POST /groups/:id/expenses` — Create an Expense with Equal Split
+#### `POST /groups/:id/expenses` — Create an Expense (Equal or Custom Splits)
 
-Creates an expense for a group with an exact integer-cent equal split among all group members in a single atomic SQLite transaction across `expenses` and `expense_splits`.
+Creates an expense for a group with an exact integer-cent split among specified participants (or an equal split across all group members if omitted) in a single atomic SQLite transaction across `expenses` and `expense_splits`.
 
-**Arithmetic & Remainder Distribution**:
-- All amounts (`amount` on expenses and `amount` on splits) are stored as integer cents.
-- Given an expense of `total` cents and `N` group members ordered by `user_id ASC`:
+**Default Equal Split**:
+- When no split parameters are provided, the expense is split equally among all members of the group.
+- Given `total` cents and `N` members ordered by `user_id ASC`:
   - `base = Math.floor(total / N)`
   - `remainder = total % N`
-  - The first `remainder` members by `user_id ASC` each absorb one extra cent (`base + 1`); the remaining members absorb `base` cents.
-  - Split amounts sum exactly to `total` for every input (including `1000 / 3` → `334, 333, 333` and `1 / 3` → `1, 0, 0`).
+  - The first `remainder` members by `user_id ASC` each absorb one extra cent (`base + 1`); remaining members absorb `base` cents.
+  - Split amounts always sum exactly to `total`.
+
+**Custom Splits**:
+Callers may specify custom splits using one of three modes:
+1. **Explicit Amounts**: Exact integer-cent amounts per member.
+   - Array format: `splits: [{ user_id: 1, amount: 4000 }, { user_id: 2, amount: 2000 }]`
+   - Object format: `splits: { "1": 4000, "2": 2000 }` or `split_amounts: { "Alice": 4000, "Bob": 2000 }`
+   - Sum of split amounts must equal expense `amount` exactly.
+2. **Ratios / Shares**: Relative proportions distributed using the deterministic largest remainder method.
+   - Array format: `splits: [{ user_id: 1, ratio: 2 }, { user_id: 2, ratio: 1 }]` or `shares: [{ user_id: 1, shares: 2 }, ...]`
+   - Object format: `shares: { "1": 2, "2": 1 }` or `ratios: { "Alice": 2, "Bob": 1 }`
+   - Deterministic remainder allocation: remainder cents are allocated to participants with the largest fractional remainder. Ties are broken deterministically by `user_id ASC`.
+3. **Percentages**: Percentage shares distributed using the deterministic largest remainder method.
+   - Array format: `splits: [{ user_id: 1, percentage: 60 }, { user_id: 2, percentage: 40 }]`
+   - Object format: `percentages: { "1": 60, "2": 40 }` or `percentages: { "Alice": 50, "Bob": 50 }`
+   - Percentages must sum to 100 exactly (e.g. `50` + `50`, or `33.33` + `33.33` + `33.34`).
+   - Remainder cents allocated to largest fractional remainder; ties broken by `user_id ASC`.
+4. **Equal Subsets**: Equal split among a specified subset of members.
+   - `splits: [1, 2]` (array of user IDs or names) with `split_type: "equal"` or omitted.
+   - Splits are calculated equally among only the specified members; omitted group members owe 0 cents.
+
+**Participant Resolution & Aliases**:
+- Participants can be identified in split objects by: `user_id`, `userId`, `user`, `member_id`, `member`, `id`, or `name` (matched case-insensitively).
+- In object maps (e.g. `{ "1": 3000 }` or `{ "Alice": 3000 }`), keys are parsed as numeric user IDs if positive integers, or as user names.
+- All participants must be existing members of the group.
+
+**Split Value Properties & Ambiguity**:
+- In split items (array format), callers specify a split value using amount keys (`amount`, `split_amount`), ratio keys (`ratio`, `shares`, `weight`), or percentage keys (`percentage`, `percent`, `pct`).
+- The item vocabulary is closed: split item objects may only carry participant aliases (`user_id`, `userId`, `user`, `member_id`, `member`, `id`, `name`) and recognized value keys (`amount`, `split_amount`, `ratio`, `shares`, `weight`, `percentage`, `percent`, `pct`). Unrecognized or misspelled properties (e.g. `ratios`, `share`, `percentages`, `amounts`) are rejected with `400 Bad Request` (`Unknown property '...' in split item`). Equal-subset items carrying only a participant alias (e.g. `[{ userId: 1 }, { userId: 2 }]`) are valid and calculate an equal split across those members.
+- At most one split value property may be provided per item. Specifying multiple value properties—whether across different categories (e.g. `amount` and `ratio`) or within the same category (e.g. `ratio` and `shares`, `amount` and `split_amount`, `percentage` and `pct`)—is ambiguous and rejected with `400 Bad Request` (`Ambiguous split specification in split item`).
+- Top-level split vocabulary: split item value keys (`ratio`, `share`, `weight`, `percentage`, `percent`, `pct`, `split_amount`) are rejected at the top level with `400 Bad Request` (`Unrecognized split property '...' at top level`), whether specified alone or alongside valid split properties. Unrelated metadata properties (`notes`, `currency`, `category`, `receipt_url`) remain permitted.
 
 **Payer Contract**:
-- Payer can be specified via `paid_by` (or `payer_id`), as a user ID (positive integer), user name (string, matched case-insensitively), or object (`{ id }` or `{ name }`).
+- Payer can be specified via `paid_by` (or `payer_id`, `payer`), as a user ID (positive integer), user name (string, matched case-insensitively), or object (`{ id }` or `{ name }`).
 - The payer must be an existing member of the group. A non-member payer is rejected with `400 Bad Request`.
 
 **Date Validation**:
 - `date` is optional. If provided, it must be a valid timestamp in `YYYY-MM-DD HH:MM:SS` format.
-- Bare `'now'`, non-standard formats (e.g. ISO 8601 with `T`), and invalid calendar dates (e.g. `2026-02-30 00:00:00`, `2026-09-05 24:00:00`) are rejected with `400 Bad Request`.
+- Bare `'now'`, non-standard formats (e.g. ISO 8601 with `T`), and invalid calendar dates are rejected with `400 Bad Request`.
 - If omitted, `date` defaults to SQLite's `CURRENT_TIMESTAMP`.
 
-**Request Body**:
+**Request Body Examples**:
 ```json
+// Equal split default
 {
   "amount": 6000,
   "description": "Groceries",
+  "paid_by": 1
+}
+
+// Explicit amounts
+{
+  "amount": 6000,
+  "description": "Dinner",
+  "paid_by": "Alice",
+  "splits": [
+    { "user_id": 1, "amount": 4000 },
+    { "user_id": 2, "amount": 2000 }
+  ]
+}
+
+// Ratios / Shares
+{
+  "amount": 1000,
+  "description": "Cabin rental",
   "paid_by": 1,
-  "date": "2026-09-11 19:00:00"
+  "shares": {
+    "Alice": 2,
+    "Bob": 1
+  }
+}
+
+// Percentages
+{
+  "amount": 5000,
+  "description": "Utilities",
+  "paid_by": 2,
+  "percentages": {
+    "Alice": 60,
+    "Bob": 40
+  }
 }
 ```
 
@@ -159,7 +222,7 @@ Creates an expense for a group with an exact integer-cent equal split among all 
   "group_id": 1,
   "paid_by": 1,
   "amount": 6000,
-  "description": "Groceries",
+  "description": "Dinner",
   "date": "2026-09-11 19:00:00",
   "created_at": "2026-09-11 19:00:00",
   "splits": [
@@ -168,7 +231,7 @@ Creates an expense for a group with an exact integer-cent equal split among all 
       "expense_id": 1,
       "user_id": 1,
       "user_name": "Alice",
-      "amount": 2000,
+      "amount": 4000,
       "created_at": "2026-09-11 19:00:00"
     },
     {
@@ -178,18 +241,34 @@ Creates an expense for a group with an exact integer-cent equal split among all 
       "user_name": "Bob",
       "amount": 2000,
       "created_at": "2026-09-11 19:00:00"
-    },
-    {
-      "id": 3,
-      "expense_id": 1,
-      "user_id": 3,
-      "user_name": "Charlie",
-      "amount": 2000,
-      "created_at": "2026-09-11 19:00:00"
     }
   ]
 }
 ```
+
+**Validation & Error Responses (`400 Bad Request` / `404 Not Found`)**:
+- Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
+- Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
+- Missing or invalid amount (<= 0, float, non-integer): `400 Bad Request` `{ "error": "Amount must be a positive integer in cents" }`
+- Missing payer: `400 Bad Request` `{ "error": "Payer is required" }`
+- Payer not a member of group: `400 Bad Request` `{ "error": "Payer must be a member of the group" }`
+- Participant not a member of group: `400 Bad Request` `{ "error": "Participant must be a member of the group" }`
+- Duplicate participant in splits: `400 Bad Request` `{ "error": "Duplicate participant in splits" }`
+- Empty split set: `400 Bad Request` `{ "error": "Splits list cannot be empty" }`
+- Non-positive or invalid split amount: `400 Bad Request` `{ "error": "Split amount must be a positive integer in cents" }`
+- Split amounts sum mismatch: `400 Bad Request` `{ "error": "Split amounts sum (...) does not equal total amount (...)" }`
+- Non-positive ratio: `400 Bad Request` `{ "error": "Split ratio must be a positive number" }`
+- Percentages do not sum to 100: `400 Bad Request` `{ "error": "Split percentages must sum to 100" }`
+- Non-positive percentage: `400 Bad Request` `{ "error": "Split percentage must be positive" }`
+- Ambiguous split specifications: `400 Bad Request` `{ "error": "Ambiguous split specification: multiple split properties provided" }`
+- Ambiguous split item: `400 Bad Request` `{ "error": "Ambiguous split specification in split item" }`
+- Unrecognized or misspelled property on split item: `400 Bad Request` `{ "error": "Unknown property '...' in split item" }`
+- Unrecognized split property at top level: `400 Bad Request` `{ "error": "Unrecognized split property '...' at top level" }`
+- Mixed split items: `400 Bad Request` `{ "error": "Mixed split specification: cannot mix amounts, ratios, and percentages" }`
+- Split type mismatch: `400 Bad Request` `{ "error": "Invalid split specification: expected ..." }`
+- Unsupported split type: `400 Bad Request` `{ "error": "Unsupported split_type: ..." }`
+- Invalid date format: `400 Bad Request` `{ "error": "Invalid date format: must be YYYY-MM-DD HH:MM:SS" }`
+- Malformed JSON payload: `400 Bad Request` `{ "error": "Invalid JSON payload" }`
 
 #### `GET /groups/:id/expenses` — List Group Expenses
 
@@ -455,6 +534,11 @@ function calculatePairwiseDebts(expenses?: ExpenseInput[], options?: BalanceOpti
 // High-level engine combining balances, net_balances, simplified settlements, pairwise, and total_spend
 function calculateBalances(expenses?: ExpenseInput[], options?: BalanceOptions): GroupBalanceSummary;
 
+// Pure split calculation functions using exact integer cents and deterministic largest remainder distribution
+function calculateExactSplits(totalAmount: number, splits: ExactSplitItem[]): CalculatedSplit[];
+function calculateRatioSplits(totalAmount: number, ratios: RatioSplitItem[]): CalculatedSplit[];
+function calculatePercentageSplits(totalAmount: number, percentages: PercentageSplitItem[]): CalculatedSplit[];
+
 // Checked integer addition and subtraction validating safe-integer arguments (INVALID_AMOUNT) and throwing INTEGER_OVERFLOW if safe-integer domain is breached
 function checkedAdd(a: number, b: number, context?: string): number;
 function checkedSub(a: number, b: number, context?: string): number;
@@ -463,6 +547,37 @@ function checkedSub(a: number, b: number, context?: string): number;
 ### Exported Types
 
 ```typescript
+export interface CalculatedSplit {
+  userId: number;
+  amount: number; // integer cents
+  name?: string | null;
+}
+
+export interface ExactSplitItem {
+  user_id?: number;
+  userId?: number;
+  amount: number; // integer cents
+  name?: string | null;
+}
+
+export interface RatioSplitItem {
+  user_id?: number;
+  userId?: number;
+  ratio?: number; // positive number
+  shares?: number;
+  weight?: number;
+  name?: string | null;
+}
+
+export interface PercentageSplitItem {
+  user_id?: number;
+  userId?: number;
+  percentage?: number; // positive number, sum must equal 100
+  percent?: number;
+  pct?: number;
+  name?: string | null;
+}
+
 export interface UserBalance {
   user_id: number;
   userId: number; // alias

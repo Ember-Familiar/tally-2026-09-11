@@ -20,6 +20,9 @@ import {
   BalanceOptions,
   UserBalance,
   UserBalanceInput,
+  calculateExactSplits,
+  calculateRatioSplits,
+  calculatePercentageSplits,
 } from '../src/balances';
 
 describe('Balance Engine - Pure integer-cent calculations & debt simplification', () => {
@@ -1392,6 +1395,401 @@ describe('Balance Engine - Pure integer-cent calculations & debt simplification'
         expect(err).toBeInstanceOf(BalanceEngineError);
         expect((err as BalanceEngineError).code).toBe('INVALID_INPUT');
       }
+    });
+  });
+
+  describe('Task 9 - Pure balance engine custom splits arithmetic & remainder distribution', () => {
+    describe('calculateExactSplits', () => {
+      it('calculates exact integer-cent splits summing to total', () => {
+        const splits = calculateExactSplits(1000, [
+          { userId: 1, amount: 600, name: 'Alice' },
+          { userId: 2, amount: 400, name: 'Bob' },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 600, name: 'Alice' },
+          { userId: 2, amount: 400, name: 'Bob' },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(1000);
+      });
+
+      it('sorts calculated exact splits by userId ASC deterministically', () => {
+        const splits = calculateExactSplits(1000, [
+          { userId: 3, amount: 200 },
+          { userId: 1, amount: 500 },
+          { userId: 2, amount: 300 },
+        ]);
+        expect(splits.map((s) => s.userId)).toEqual([1, 2, 3]);
+        expect(splits.map((s) => s.amount)).toEqual([500, 300, 200]);
+      });
+
+      it('rejects empty or non-array splits', () => {
+        expect(() => calculateExactSplits(1000, [])).toThrow(BalanceEngineError);
+        expect(() => calculateExactSplits(1000, null as unknown as [])).toThrow(BalanceEngineError);
+      });
+
+      it('rejects non-object split items', () => {
+        expect(() => calculateExactSplits(1000, [null as unknown as { userId: number; amount: number }])).toThrow(
+          BalanceEngineError
+        );
+      });
+
+      it('rejects duplicate participants in exact splits', () => {
+        expect(() =>
+          calculateExactSplits(1000, [
+            { userId: 1, amount: 500 },
+            { userId: 1, amount: 500 },
+          ])
+        ).toThrow(BalanceEngineError);
+      });
+
+      it('rejects non-positive, float, or unsafe split amounts', () => {
+        expect(() => calculateExactSplits(1000, [{ userId: 1, amount: 0 }, { userId: 2, amount: 1000 }])).toThrow(
+          BalanceEngineError
+        );
+        expect(() => calculateExactSplits(1000, [{ userId: 1, amount: -100 }, { userId: 2, amount: 1100 }])).toThrow(
+          BalanceEngineError
+        );
+        expect(() => calculateExactSplits(1000, [{ userId: 1, amount: 500.5 }, { userId: 2, amount: 499.5 }])).toThrow(
+          BalanceEngineError
+        );
+        expect(() =>
+          calculateExactSplits(1000, [{ userId: 1, amount: Number.MAX_SAFE_INTEGER + 1 }, { userId: 2, amount: 100 }])
+        ).toThrow(BalanceEngineError);
+      });
+
+      it('rejects splits when sum does not equal total amount exactly', () => {
+        // sum < total
+        expect(() =>
+          calculateExactSplits(1000, [
+            { userId: 1, amount: 500 },
+            { userId: 2, amount: 499 },
+          ])
+        ).toThrow(BalanceEngineError);
+
+        // sum > total
+        expect(() =>
+          calculateExactSplits(1000, [
+            { userId: 1, amount: 500 },
+            { userId: 2, amount: 501 },
+          ])
+        ).toThrow(BalanceEngineError);
+      });
+    });
+
+    describe('calculateRatioSplits', () => {
+      it('calculates ratio splits accurately with deterministic largest remainder distribution', () => {
+        // 1000 cents with 1:2:3 ratios across users 1, 2, 3
+        // totalWeight = 6
+        // user 1: 1000/6 = 166 rem 4 -> gets +1 cent -> 167
+        // user 2: 2000/6 = 333 rem 2 -> 333
+        // user 3: 3000/6 = 500 rem 0 -> 500
+        const splits = calculateRatioSplits(1000, [
+          { userId: 1, ratio: 1 },
+          { userId: 2, ratio: 2 },
+          { userId: 3, ratio: 3 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 167, name: null },
+          { userId: 2, amount: 333, name: null },
+          { userId: 3, amount: 500, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(1000);
+      });
+
+      it('pins tiebreaking determinism by userId ASC when fractional remainders are equal', () => {
+        // 101 cents with 1:1 ratio between user 1 and user 2
+        // user 1 has rem 1, user 2 has rem 1
+        // tiebreaker allocates extra cent to lowest userId (user 1)
+        const splits = calculateRatioSplits(101, [
+          { userId: 2, ratio: 1 },
+          { userId: 1, ratio: 1 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 51, name: null },
+          { userId: 2, amount: 50, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(101);
+      });
+
+      it('handles 1 cent total amount correctly without throwing', () => {
+        const splits = calculateRatioSplits(1, [
+          { userId: 1, ratio: 1 },
+          { userId: 2, ratio: 1 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 1, name: null },
+          { userId: 2, amount: 0, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(1);
+      });
+
+      it('handles decimal ratios (e.g. 1.5 : 2.5)', () => {
+        // 400 cents with 1.5 : 2.5 ratio -> 150 : 250
+        const splits = calculateRatioSplits(400, [
+          { userId: 1, ratio: 1.5 },
+          { userId: 2, ratio: 2.5 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 150, name: null },
+          { userId: 2, amount: 250, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(400);
+      });
+
+      it('rejects empty, duplicate, or non-positive ratios', () => {
+        expect(() => calculateRatioSplits(1000, [])).toThrow(BalanceEngineError);
+        expect(() =>
+          calculateRatioSplits(1000, [
+            { userId: 1, ratio: 1 },
+            { userId: 1, ratio: 2 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculateRatioSplits(1000, [
+            { userId: 1, ratio: 0 },
+            { userId: 2, ratio: 1 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculateRatioSplits(1000, [
+            { userId: 1, ratio: -1 },
+            { userId: 2, ratio: 1 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculateRatioSplits(1000, [
+            { userId: 1, ratio: NaN },
+            { userId: 2, ratio: 1 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculateRatioSplits(1000, [
+            { userId: 1, ratio: 1, shares: 2 },
+            { userId: 2, ratio: 1 },
+          ])
+        ).toThrow(BalanceEngineError);
+      });
+
+      it('rejects ratio that overflows scaled multiplication with BalanceEngineError', () => {
+        expect(() =>
+          calculateRatioSplits(1000, [
+            { userId: 1, ratio: 0.5 },
+            { userId: 2, ratio: 1e308 },
+          ])
+        ).toThrow(BalanceEngineError);
+      });
+
+      it('preserves exact BigInt remainder ordering beyond 2^53', () => {
+        const splits = calculateRatioSplits(7, [
+          { userId: 1, ratio: 1e290 },
+          { userId: 2, ratio: 1.3e291 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 0, name: null },
+          { userId: 2, amount: 7, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(7);
+      });
+
+      it('property test: sum(splits) === total for 1,000 random ratio scenarios', () => {
+        for (let seed = 1; seed <= 1000; seed++) {
+          const total = (seed * 997) % 500000 + 1; // 1 to 500,000 cents
+          const numMembers = (seed % 7) + 2; // 2 to 8 members
+          const ratios = [];
+          for (let m = 1; m <= numMembers; m++) {
+            const r = ((seed * m * 31) % 100) + 1; // 1 to 100
+            ratios.push({ userId: m, ratio: r });
+          }
+          const result = calculateRatioSplits(total, ratios);
+          const sum = result.reduce((acc, s) => acc + s.amount, 0);
+          expect(sum).toBe(total);
+          for (const s of result) {
+            expect(Number.isSafeInteger(s.amount)).toBe(true);
+            expect(s.amount).toBeGreaterThanOrEqual(0);
+          }
+        }
+      });
+    });
+
+    describe('calculatePercentageSplits', () => {
+      it('calculates exact percentage splits summing to 100%', () => {
+        const splits = calculatePercentageSplits(10000, [
+          { userId: 1, percentage: 60 },
+          { userId: 2, percentage: 40 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 6000, name: null },
+          { userId: 2, amount: 4000, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(10000);
+      });
+
+      it('allocates remainder cents deterministically to highest fractional percentage', () => {
+        // 1000 cents with 33.33%, 33.33%, 33.34%
+        // user 3 has fractional 0.4 vs 0.3 -> user 3 absorbs the remainder cent
+        const splits = calculatePercentageSplits(1000, [
+          { userId: 1, percentage: 33.33 },
+          { userId: 2, percentage: 33.33 },
+          { userId: 3, percentage: 33.34 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 333, name: null },
+          { userId: 2, amount: 333, name: null },
+          { userId: 3, amount: 334, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(1000);
+      });
+
+      it('pins tiebreaking determinism by userId ASC when percentages are equal', () => {
+        // 101 cents with 50% / 50%
+        const splits = calculatePercentageSplits(101, [
+          { userId: 2, percentage: 50 },
+          { userId: 1, percentage: 50 },
+        ]);
+        expect(splits).toEqual([
+          { userId: 1, amount: 51, name: null },
+          { userId: 2, amount: 50, name: null },
+        ]);
+        expect(splits.reduce((acc, s) => acc + s.amount, 0)).toBe(101);
+      });
+
+      it('rejects percentages that do not total 100', () => {
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: 50 },
+            { userId: 2, percentage: 49 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: 50 },
+            { userId: 2, percentage: 51 },
+          ])
+        ).toThrow(BalanceEngineError);
+        // Decimal proportions like 0.5 + 0.5 = 1.0 must be rejected
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: 0.5 },
+            { userId: 2, percentage: 0.5 },
+          ])
+        ).toThrow(BalanceEngineError);
+      });
+
+      it('rejects non-positive, empty, or duplicate percentages', () => {
+        expect(() => calculatePercentageSplits(1000, [])).toThrow(BalanceEngineError);
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: 0 },
+            { userId: 2, percentage: 100 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: -10 },
+            { userId: 2, percentage: 110 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: 50 },
+            { userId: 1, percentage: 50 },
+          ])
+        ).toThrow(BalanceEngineError);
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: 50, pct: 50 },
+            { userId: 2, percentage: 50 },
+          ])
+        ).toThrow(BalanceEngineError);
+      });
+
+      it('rejects percentage that rounds to 0 weight inside sum tolerance with BalanceEngineError', () => {
+        expect(() =>
+          calculatePercentageSplits(1000, [
+            { userId: 1, percentage: 100 },
+            { userId: 2, percentage: 1e-7 },
+          ])
+        ).toThrow(BalanceEngineError);
+      });
+
+      it('property test: sum(splits) === total for 1,000 random percentage scenarios', () => {
+        for (let seed = 1; seed <= 1000; seed++) {
+          const total = (seed * 883) % 400000 + 1;
+          const p1 = (seed % 80) + 10; // 10 to 89
+          const p2 = 100 - p1;
+          const result = calculatePercentageSplits(total, [
+            { userId: 1, percentage: p1 },
+            { userId: 2, percentage: p2 },
+          ]);
+          const sum = result.reduce((acc, s) => acc + s.amount, 0);
+          expect(sum).toBe(total);
+          for (const s of result) {
+            expect(Number.isSafeInteger(s.amount)).toBe(true);
+            expect(s.amount).toBeGreaterThanOrEqual(0);
+          }
+        }
+      });
+    });
+
+    describe('calculateBalances integration with custom splits', () => {
+      it('preserves zero-sum conservation and accurate total_spend across unequal splits', () => {
+        const summary = calculateBalances(
+          [
+            {
+              id: 1,
+              paid_by: 1,
+              amount: 6000,
+              splits: [
+                { user_id: 1, amount: 4000 },
+                { user_id: 2, amount: 2000 },
+              ],
+            },
+            {
+              id: 2,
+              paid_by: 2,
+              amount: 3000,
+              shares: { 1: 1, 2: 2 },
+            },
+          ],
+          { members: [1, 2] }
+        );
+
+        expect(summary.total_spend).toBe(9000);
+        // Expense 1: User 1 paid 6000, owes 4000 (net +2000). User 2 owes 2000 (net -2000).
+        // Expense 2: User 2 paid 3000, shares 1:2 -> User 1 owes 1000, User 2 owes 2000.
+        // Overall: User 1 paid 6000, owes 5000 -> net +1000. User 2 paid 3000, owes 4000 -> net -1000.
+        expect(summary.net_balances[1]).toBe(1000);
+        expect(summary.net_balances[2]).toBe(-1000);
+        const netSum = Object.values(summary.net_balances).reduce((acc, b) => acc + b, 0);
+        expect(netSum).toBe(0);
+
+        // Settlements should settle 1000 from user 2 to user 1
+        expect(summary.settlements).toEqual([
+          {
+            from: 2,
+            from_user_id: 2,
+            to: 1,
+            to_user_id: 1,
+            amount: 1000,
+          },
+        ]);
+      });
+
+      it('rejects splits in calculateBalances where ratio is present after equal split item', () => {
+        expect(() =>
+          calculateBalances(
+            [
+              {
+                id: 1,
+                paid_by: 1,
+                amount: 1000,
+                splits: [{ user_id: 1 }, { user_id: 2, ratio: 3 }],
+              },
+            ],
+            { members: [{ id: 1, name: 'A' }, { id: 2, name: 'B' }] }
+          )
+        ).toThrow(BalanceEngineError);
+      });
     });
   });
 });

@@ -1,6 +1,16 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import Database from 'better-sqlite3';
-import { calculateBalances, BalanceEngineError, SettlementInput } from '../balances';
+import {
+  calculateBalances,
+  BalanceEngineError,
+  SettlementInput,
+  calculateExactSplits,
+  calculateRatioSplits,
+  calculatePercentageSplits,
+  ExactSplitItem,
+  RatioSplitItem,
+  PercentageSplitItem,
+} from '../balances';
 
 export interface Settlement {
   id: number;
@@ -324,44 +334,6 @@ export function createGroupRouter(db: Database.Database): Router {
      ORDER BY s.date DESC, s.id DESC`
   );
 
-  function getGroupExpensesWithSplits(groupId: number): Expense[] {
-    const expenses = selectExpensesByGroupId.all(groupId) as {
-      id: number;
-      group_id: number;
-      paid_by: number;
-      amount: number;
-      description: string;
-      date: string;
-      created_at: string;
-    }[];
-
-    if (expenses.length === 0) {
-      return [];
-    }
-
-    const splits = selectSplitsByGroupId.all(groupId) as ExpenseSplit[];
-    const splitsByExpenseId = new Map<number, ExpenseSplit[]>();
-    for (const split of splits) {
-      let list = splitsByExpenseId.get(split.expense_id);
-      if (!list) {
-        list = [];
-        splitsByExpenseId.set(split.expense_id, list);
-      }
-      list.push(split);
-    }
-
-    return expenses.map((exp) => ({
-      id: exp.id,
-      group_id: exp.group_id,
-      paid_by: exp.paid_by,
-      amount: exp.amount,
-      description: exp.description,
-      date: exp.date,
-      created_at: exp.created_at,
-      splits: splitsByExpenseId.get(exp.id) ?? [],
-    }));
-  }
-
   const createExpenseTransaction = db.transaction(
     (
       groupId: number,
@@ -369,7 +341,7 @@ export function createGroupRouter(db: Database.Database): Router {
       amount: number,
       description: string,
       date: string | undefined,
-      memberUserIds: number[]
+      splits: CalculatedSplit[]
     ): Expense => {
       let expenseId: number;
       if (date !== undefined) {
@@ -380,7 +352,6 @@ export function createGroupRouter(db: Database.Database): Router {
         expenseId = Number(expInfo.lastInsertRowid);
       }
 
-      const splits = calculateEqualSplits(amount, memberUserIds);
       for (const s of splits) {
         insertSplitStmt.run(expenseId, s.userId, s.amount);
       }
@@ -459,9 +430,74 @@ export function createGroupRouter(db: Database.Database): Router {
     }
   );
 
+  function getGroupExpensesWithSplits(groupId: number): Expense[] {
+    const expenses = selectExpensesByGroupId.all(groupId) as {
+      id: number;
+      group_id: number;
+      paid_by: number;
+      amount: number;
+      description: string;
+      date: string;
+      created_at: string;
+    }[];
+
+    if (expenses.length === 0) {
+      return [];
+    }
+
+    const splits = selectSplitsByGroupId.all(groupId) as ExpenseSplit[];
+    const splitsByExpenseId = new Map<number, ExpenseSplit[]>();
+    for (const split of splits) {
+      let list = splitsByExpenseId.get(split.expense_id);
+      if (!list) {
+        list = [];
+        splitsByExpenseId.set(split.expense_id, list);
+      }
+      list.push(split);
+    }
+
+    return expenses.map((exp) => ({
+      id: exp.id,
+      group_id: exp.group_id,
+      paid_by: exp.paid_by,
+      amount: exp.amount,
+      description: exp.description,
+      date: exp.date,
+      created_at: exp.created_at,
+      splits: splitsByExpenseId.get(exp.id) ?? [],
+    }));
+  }
+
   const EXPENSE_PAYER_ALIASES = ['paid_by', 'payer_id', 'payer'];
   const SETTLE_FROM_ALIASES = ['from', 'from_user_id', 'paid_by', 'payer_id', 'payer'];
   const SETTLE_TO_ALIASES = ['to', 'to_user_id', 'paid_to', 'payee_id', 'payee', 'received_by'];
+  const SPLIT_PARTICIPANT_ALIASES = ['user_id', 'userId', 'user', 'member_id', 'member', 'id', 'name'];
+  const ALLOWED_SPLIT_ITEM_KEYS = new Set([
+    'user_id',
+    'userId',
+    'user',
+    'member_id',
+    'member',
+    'id',
+    'name',
+    'amount',
+    'split_amount',
+    'ratio',
+    'shares',
+    'weight',
+    'percentage',
+    'percent',
+    'pct',
+  ]);
+  const DISALLOWED_TOP_LEVEL_SPLIT_KEYS = [
+    'ratio',
+    'share',
+    'weight',
+    'percentage',
+    'percent',
+    'pct',
+    'split_amount',
+  ] as const;
 
   function resolveGroupParticipant(
     rawOrBody: unknown,
@@ -549,6 +585,312 @@ export function createGroupRouter(db: Database.Database): Router {
     return userId;
   }
 
+  function resolveAndCalculateSplits(
+    groupId: number,
+    amount: number,
+    body: Record<string, unknown>,
+    defaultMemberIds: number[]
+  ): CalculatedSplit[] {
+    const hasSplits = body.splits !== undefined;
+    const hasShares = body.shares !== undefined;
+    const hasRatios = body.ratios !== undefined;
+    const hasPercentages = body.percentages !== undefined;
+    const hasSplitAmounts = body.split_amounts !== undefined;
+
+    const countProps =
+      (hasSplits ? 1 : 0) +
+      (hasShares ? 1 : 0) +
+      (hasRatios ? 1 : 0) +
+      (hasPercentages ? 1 : 0) +
+      (hasSplitAmounts ? 1 : 0);
+
+    if (countProps > 1) {
+      throw new ValidationError('Ambiguous split specification: multiple split properties provided');
+    }
+
+    const rawSplitType = body.split_type;
+    let splitType: string | undefined;
+    if (rawSplitType !== undefined && rawSplitType !== null) {
+      if (typeof rawSplitType !== 'string') {
+        throw new ValidationError('split_type must be a string');
+      }
+      const lower = rawSplitType.trim().toLowerCase();
+      const validTypes = [
+        'equal',
+        'exact',
+        'amounts',
+        'ratio',
+        'ratios',
+        'shares',
+        'percentage',
+        'percentages',
+        'percent',
+      ];
+      if (!validTypes.includes(lower)) {
+        throw new ValidationError(`Unsupported split_type: ${rawSplitType}`);
+      }
+      splitType = lower;
+    }
+
+    for (const key of DISALLOWED_TOP_LEVEL_SPLIT_KEYS) {
+      if (body[key] !== undefined) {
+        throw new ValidationError(`Unrecognized split property '${key}' at top level`);
+      }
+    }
+
+    // Default equal split if no split specifications are present
+    if (countProps === 0) {
+      if (splitType !== undefined && splitType !== 'equal') {
+        throw new ValidationError(`Splits definition is required for split type '${rawSplitType}'`);
+      }
+      if (defaultMemberIds.length === 0) {
+        throw new ValidationError('Group has no members to split expense between');
+      }
+      return calculateEqualSplits(amount, defaultMemberIds);
+    }
+
+    let splitSource: unknown;
+    let explicitMode: 'exact' | 'ratio' | 'percentage' | undefined;
+
+    if (hasShares || hasRatios) {
+      splitSource = hasShares ? body.shares : body.ratios;
+      explicitMode = 'ratio';
+      if (splitType && !['ratio', 'ratios', 'shares'].includes(splitType)) {
+        throw new ValidationError(`Ambiguous split specification: split_type '${rawSplitType}' conflicts with shares/ratios`);
+      }
+    } else if (hasPercentages) {
+      splitSource = body.percentages;
+      explicitMode = 'percentage';
+      if (splitType && !['percentage', 'percentages', 'percent'].includes(splitType)) {
+        throw new ValidationError(`Ambiguous split specification: split_type '${rawSplitType}' conflicts with percentages`);
+      }
+    } else if (hasSplitAmounts) {
+      splitSource = body.split_amounts;
+      explicitMode = 'exact';
+      if (splitType && !['exact', 'amounts'].includes(splitType)) {
+        throw new ValidationError(`Ambiguous split specification: split_type '${rawSplitType}' conflicts with split_amounts`);
+      }
+    } else {
+      splitSource = body.splits;
+    }
+
+    if (typeof splitSource !== 'object' || splitSource === null) {
+      throw new ValidationError('Splits must be an array or object');
+    }
+
+    const seenUsers = new Set<number>();
+
+    // Object format (mapping user key -> split value)
+    if (!Array.isArray(splitSource)) {
+      const entries = Object.entries(splitSource);
+      if (entries.length === 0) {
+        throw new ValidationError('Splits list cannot be empty');
+      }
+
+      let mode = explicitMode;
+      if (!mode) {
+        if (splitType && ['ratio', 'ratios', 'shares'].includes(splitType)) {
+          mode = 'ratio';
+        } else if (splitType && ['percentage', 'percentages', 'percent'].includes(splitType)) {
+          mode = 'percentage';
+        } else {
+          mode = 'exact';
+        }
+      }
+
+      const exactItems: ExactSplitItem[] = [];
+      const ratioItems: RatioSplitItem[] = [];
+      const pctItems: PercentageSplitItem[] = [];
+
+      for (const [key, val] of entries) {
+        const parsedKeyId = parseId(key);
+        const participantInput = parsedKeyId !== null ? { id: parsedKeyId } : { name: key };
+        const userId = resolveGroupParticipant(participantInput, 'Participant', groupId);
+        if (seenUsers.has(userId)) {
+          throw new ValidationError('Duplicate participant in splits');
+        }
+        seenUsers.add(userId);
+
+        if (mode === 'exact') {
+          if (typeof val !== 'number' || !Number.isSafeInteger(val) || val <= 0) {
+            throw new ValidationError('Split amount must be a positive integer in cents');
+          }
+          exactItems.push({ userId, amount: val });
+        } else if (mode === 'ratio') {
+          if (typeof val !== 'number' || !Number.isFinite(val) || val <= 0) {
+            throw new ValidationError('Split ratio must be a positive number');
+          }
+          ratioItems.push({ userId, ratio: val });
+        } else {
+          // percentage
+          if (typeof val !== 'number' || !Number.isFinite(val) || val <= 0) {
+            throw new ValidationError('Split percentage must be positive');
+          }
+          pctItems.push({ userId, percentage: val });
+        }
+      }
+
+      try {
+        if (mode === 'exact') {
+          return calculateExactSplits(amount, exactItems);
+        } else if (mode === 'ratio') {
+          return calculateRatioSplits(amount, ratioItems);
+        } else {
+          return calculatePercentageSplits(amount, pctItems);
+        }
+      } catch (err) {
+        if (err instanceof BalanceEngineError) {
+          throw new ValidationError(err.message);
+        }
+        throw err;
+      }
+    }
+
+    // Array format
+    const arr = splitSource as unknown[];
+    if (arr.length === 0) {
+      throw new ValidationError('Splits list cannot be empty');
+    }
+
+    // Check if items are primitive strings/numbers (equal split across subset of members)
+    const isAllPrimitives = arr.every((item) => typeof item === 'string' || typeof item === 'number');
+    if (isAllPrimitives) {
+      if (explicitMode || (splitType && splitType !== 'equal')) {
+        throw new ValidationError(`Expected split values for split type '${rawSplitType ?? explicitMode}'`);
+      }
+      const resolvedIds: number[] = [];
+      for (const item of arr) {
+        const userId = resolveGroupParticipant(item, 'Participant', groupId);
+        if (seenUsers.has(userId)) {
+          throw new ValidationError('Duplicate participant in splits');
+        }
+        seenUsers.add(userId);
+        resolvedIds.push(userId);
+      }
+      return calculateEqualSplits(amount, resolvedIds);
+    }
+
+    let detectedType: 'exact' | 'ratio' | 'percentage' | 'equal' | undefined;
+    const exactItems: ExactSplitItem[] = [];
+    const ratioItems: RatioSplitItem[] = [];
+    const pctItems: PercentageSplitItem[] = [];
+    const equalMembers: number[] = [];
+
+    for (const item of arr) {
+      if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+        throw new ValidationError('Invalid split item: must be an object');
+      }
+
+      const rec = item as Record<string, unknown>;
+      for (const key of Object.keys(rec)) {
+        if (!ALLOWED_SPLIT_ITEM_KEYS.has(key)) {
+          throw new ValidationError(`Unknown property '${key}' in split item`);
+        }
+      }
+      const userId = resolveGroupParticipant(rec, 'Participant', groupId, SPLIT_PARTICIPANT_ALIASES);
+      if (seenUsers.has(userId)) {
+        throw new ValidationError('Duplicate participant in splits');
+      }
+      seenUsers.add(userId);
+
+      const presentAmountKeys = ['amount', 'split_amount'].filter((k) => rec[k] !== undefined);
+      const presentRatioKeys = ['ratio', 'shares', 'weight'].filter((k) => rec[k] !== undefined);
+      const presentPctKeys = ['percentage', 'percent', 'pct'].filter((k) => rec[k] !== undefined);
+
+      const totalValueProps =
+        presentAmountKeys.length + presentRatioKeys.length + presentPctKeys.length;
+
+      if (totalValueProps > 1) {
+        throw new ValidationError('Ambiguous split specification in split item');
+      }
+
+      let currentItemType: 'exact' | 'ratio' | 'percentage' | 'equal';
+      let rawAmt: unknown;
+      let rawRatio: unknown;
+      let rawPct: unknown;
+
+      if (presentAmountKeys.length === 1) {
+        currentItemType = 'exact';
+        rawAmt = rec[presentAmountKeys[0]];
+      } else if (presentRatioKeys.length === 1) {
+        currentItemType = 'ratio';
+        rawRatio = rec[presentRatioKeys[0]];
+      } else if (presentPctKeys.length === 1) {
+        currentItemType = 'percentage';
+        rawPct = rec[presentPctKeys[0]];
+      } else {
+        currentItemType = 'equal';
+      }
+
+      if (detectedType === undefined) {
+        detectedType = currentItemType;
+      } else if (detectedType !== currentItemType) {
+        throw new ValidationError('Mixed split specification: cannot mix amounts, ratios, and percentages');
+      }
+
+      // Check against explicitMode or splitType
+      const activeMode =
+        explicitMode ??
+        (splitType === 'equal'
+          ? 'equal'
+          : ['exact', 'amounts'].includes(splitType ?? '')
+            ? 'exact'
+            : ['ratio', 'ratios', 'shares'].includes(splitType ?? '')
+              ? 'ratio'
+              : ['percentage', 'percentages', 'percent'].includes(splitType ?? '')
+                ? 'percentage'
+                : undefined);
+
+      if (activeMode && activeMode !== currentItemType) {
+        if (activeMode === 'exact') {
+          throw new ValidationError('Invalid split specification: expected amounts for exact split');
+        } else if (activeMode === 'ratio') {
+          throw new ValidationError('Invalid split specification: expected ratios/shares');
+        } else if (activeMode === 'percentage') {
+          throw new ValidationError('Invalid split specification: expected percentages');
+        } else if (activeMode === 'equal') {
+          throw new ValidationError('Invalid split specification: unexpected split values for equal split');
+        }
+      }
+
+      if (currentItemType === 'exact') {
+        if (typeof rawAmt !== 'number' || !Number.isSafeInteger(rawAmt) || rawAmt <= 0) {
+          throw new ValidationError('Split amount must be a positive integer in cents');
+        }
+        exactItems.push({ userId, amount: rawAmt });
+      } else if (currentItemType === 'ratio') {
+        if (typeof rawRatio !== 'number' || !Number.isFinite(rawRatio) || rawRatio <= 0) {
+          throw new ValidationError('Split ratio must be a positive number');
+        }
+        ratioItems.push({ userId, ratio: rawRatio });
+      } else if (currentItemType === 'percentage') {
+        if (typeof rawPct !== 'number' || !Number.isFinite(rawPct) || rawPct <= 0) {
+          throw new ValidationError('Split percentage must be positive');
+        }
+        pctItems.push({ userId, percentage: rawPct });
+      } else {
+        equalMembers.push(userId);
+      }
+    }
+
+    try {
+      if (detectedType === 'exact') {
+        return calculateExactSplits(amount, exactItems);
+      } else if (detectedType === 'ratio') {
+        return calculateRatioSplits(amount, ratioItems);
+      } else if (detectedType === 'percentage') {
+        return calculatePercentageSplits(amount, pctItems);
+      } else {
+        return calculateEqualSplits(amount, equalMembers);
+      }
+    } catch (err) {
+      if (err instanceof BalanceEngineError) {
+        throw new ValidationError(err.message);
+      }
+      throw err;
+    }
+  }
+
   // POST /groups - Create group with name and initial members
   router.post('/', (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -610,23 +952,23 @@ export function createGroupRouter(db: Database.Database): Router {
     }
   });
 
-  // GET /groups/:id - Get group by id
+  // GET /groups/:id - Detail for a single group
   router.get('/:id', (req: Request, res: Response, next: NextFunction) => {
     try {
       const rawId = req.params.id;
-      const id = parseId(rawId);
-      if (id === null) {
+      const groupId = parseId(rawId);
+      if (groupId === null) {
         res.status(400).json({ error: 'Invalid group ID: must be a positive integer' });
         return;
       }
 
-      const group = selectGroupById.get(id) as { id: number; name: string; created_at: string } | undefined;
+      const group = selectGroupById.get(groupId) as { id: number; name: string; created_at: string } | undefined;
       if (!group) {
         res.status(404).json({ error: 'Group not found' });
         return;
       }
 
-      const members = selectGroupMembers.all(id) as Member[];
+      const members = selectGroupMembers.all(groupId) as Member[];
       res.status(200).json({
         id: group.id,
         name: group.name,
@@ -638,7 +980,7 @@ export function createGroupRouter(db: Database.Database): Router {
     }
   });
 
-  // POST /groups/:id/expenses - Add an expense to a group with equal split
+  // POST /groups/:id/expenses - Add an expense with equal split among group members
   router.post('/:id/expenses', (req: Request, res: Response, next: NextFunction) => {
     try {
       const rawId = req.params.id;
@@ -663,12 +1005,9 @@ export function createGroupRouter(db: Database.Database): Router {
 
       const memberRows = selectGroupMemberIds.all(groupId) as { user_id: number }[];
       const memberIds = memberRows.map((r) => r.user_id);
-      if (memberIds.length === 0) {
-        res.status(400).json({ error: 'Group has no members to split expense between' });
-        return;
-      }
 
-      const expense = createExpenseTransaction(groupId, payerUserId, amount, description, date, memberIds);
+      const calculatedSplits = resolveAndCalculateSplits(groupId, amount, body, memberIds);
+      const expense = createExpenseTransaction(groupId, payerUserId, amount, description, date, calculatedSplits);
       res.status(201).json(expense);
     } catch (err) {
       if (err instanceof ValidationError) {
