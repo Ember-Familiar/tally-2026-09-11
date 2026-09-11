@@ -33,6 +33,36 @@ This starts the server on port 3000 by default (`node dist/server.js`), using th
 - `GET /health` or `GET /api/health`
   - Returns `200 OK` with `{"status":"ok"}`.
 
+### Validation & Error Handling Contract
+
+All endpoints adhere to a uniform JSON error contract. Error responses always return a JSON object containing a typed `error` string:
+
+```json
+{
+  "error": "Descriptive error message"
+}
+```
+
+#### Status Code Conventions:
+- **`400 Bad Request`**: Returned for all client input validation errors:
+  - Missing required fields (e.g. `name`, `amount`, `paid_by`).
+  - Malformed or non-canonical identifiers: IDs in URLs and payloads must be strictly canonical positive decimal integers (`1`, `2`, ...). Non-canonical strings with leading zeros (e.g. `01`, `007`) or invalid formats are rejected (`Invalid group ID: must be a positive integer`).
+  - Invalid amounts: amounts must be safe positive integers in integer cents (`amount > 0`). Floating-point numbers, negative values, and zero are rejected.
+  - Participant membership: payers, payees, and split participants must be members of the group. Name lookups are scoped strictly to group members.
+  - Contradictory split specifications: supplying split values alongside `split_type: "equal"` is rejected (`Invalid split specification: unexpected split values for equal split`) across both object and array payload formats.
+  - Strict type validation: `null` is rejected for fields expecting strings or objects (e.g. `split_type: null` returns `split_type must be a string`).
+  - Malformed JSON payloads return `{ "error": "Invalid JSON payload" }`.
+  - Malformed bodies, decompressor failures, or invalid encoding headers return `{ "error": "Bad request" }`.
+- **`404 Not Found`**:
+  - Missing resources return `{ "error": "Group not found" }`.
+  - Unmatched routes and path-traversal normalizations (e.g. `/groups/../expenses`) return `{ "error": "Not found" }`.
+- **`413 Payload Too Large`**:
+  - Payloads exceeding body parser size limits return `{ "error": "Payload too large" }`. Absolute filesystem paths and internal stack traces are completely suppressed.
+- **`415 Unsupported Media Type`**:
+  - Unsupported content encodings (e.g. `Content-Encoding: br-nope`) return `{ "error": "Unsupported media type" }`.
+- **`500 Internal Server Error`**:
+  - Unexpected internal server errors, database failures, and persistent data corruption invariant violations return `{ "error": "Internal server error" }` without leaking stack traces, source paths, or internal row/check details to clients.
+
 ### Groups
 
 #### `POST /groups` — Create a Group
@@ -117,7 +147,7 @@ Returns a single group with its members by group ID.
 
 **Error Responses**:
 - `404 Not Found`: `{ "error": "Group not found" }` when the group ID does not exist.
-- `400 Bad Request`: `{ "error": "Invalid group ID: must be a positive integer" }` when `:id` is not a positive integer (e.g., `/groups/abc`, `/groups/-1`, `/groups/0`).
+- `400 Bad Request`: `{ "error": "Invalid group ID: must be a positive integer" }` when `:id` is not a strictly canonical positive integer (e.g., `/groups/abc`, `/groups/-1`, `/groups/0`, `/groups/01`).
 
 ### Expenses
 
@@ -164,8 +194,13 @@ Callers may specify custom splits using one of three modes:
 - Top-level split vocabulary: split item value keys (`ratio`, `share`, `weight`, `percentage`, `percent`, `pct`, `split_amount`) are rejected at the top level with `400 Bad Request` (`Unrecognized split property '...' at top level`), whether specified alone or alongside valid split properties. Unrelated metadata properties (`notes`, `currency`, `category`, `receipt_url`) remain permitted.
 
 **Payer Contract**:
-- Payer can be specified via `paid_by` (or `payer_id`, `payer`), as a user ID (positive integer), user name (string, matched case-insensitively), or object (`{ id }` or `{ name }`).
-- The payer must be an existing member of the group. A non-member payer is rejected with `400 Bad Request`.
+- Payer can be specified via `paid_by` (or `payer_id`, `payer`), as a user ID (positive integer), user name (string, matched case-insensitively against group members), or object (`{ id }` or `{ name }`).
+- Alias precedence: if multiple aliases are provided in a request, precedence is:
+  - Expense payer: `paid_by` > `payer_id` > `payer`
+  - Settlement debtor (`from`): `from` > `from_user_id` > `paid_by` > `payer_id` > `payer`
+  - Settlement creditor (`to`): `to` > `to_user_id` > `paid_to` > `payee_id` > `payee` > `received_by`
+  - Split participants: `user_id` > `userId` > `user` > `member_id` > `member` > `id` > `name`
+- The payer must be an existing member of the group. Name matching is scoped to the group's members, ensuring duplicate user names across different groups resolve correctly. A non-member payer is rejected with `400 Bad Request`.
 
 **Date Validation**:
 - `date` is optional. If provided, it must be a valid timestamp in `YYYY-MM-DD HH:MM:SS` format.
@@ -266,6 +301,8 @@ Callers may specify custom splits using one of three modes:
 - Unrecognized split property at top level: `400 Bad Request` `{ "error": "Unrecognized split property '...' at top level" }`
 - Mixed split items: `400 Bad Request` `{ "error": "Mixed split specification: cannot mix amounts, ratios, and percentages" }`
 - Split type mismatch: `400 Bad Request` `{ "error": "Invalid split specification: expected ..." }`
+- Split values provided with equal split_type: `400 Bad Request` `{ "error": "Invalid split specification: unexpected split values for equal split" }`
+- Non-string or null split_type: `400 Bad Request` `{ "error": "split_type must be a string" }`
 - Unsupported split type: `400 Bad Request` `{ "error": "Unsupported split_type: ..." }`
 - Invalid date format: `400 Bad Request` `{ "error": "Invalid date format: must be YYYY-MM-DD HH:MM:SS" }`
 - Malformed JSON payload: `400 Bad Request` `{ "error": "Invalid JSON payload" }`
@@ -419,9 +456,15 @@ Computes and returns the complete balance summary for a group, including per-use
 **Error Responses (`400 Bad Request` / `404 Not Found` / `500 Internal Server Error`)**:
 - Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
 - Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
-- Corrupt data or invariant violation: `500 Internal Server Error` `{ "error": "<details>" }` (e.g., torn splits from direct SQLite cascade deletions where `sum(splits) < amount`, conservation violations, or integer overflow).
+- Corrupt data or invariant violation: `500 Internal Server Error` `{ "error": "Internal server error" }` (e.g., non-member settlement participant, torn splits from direct SQLite cascade deletions where `sum(splits) < amount`, conservation violations, or integer overflow).
 
 ### Settlements
+
+**Settlement Group-Membership Invariant**:
+- Every settlement recorded or queried for a group must involve only current members of that group (`from_user_id` and `to_user_id` must be members of `group_id`).
+- This invariant is strictly enforced on writes (`POST /groups/:id/settle`, rejecting non-members with `400 Bad Request`).
+- The invariant is guarded across all read endpoints (`GET /groups/:id/balances` and `GET /groups/:id/settlements`). If an out-of-band database insert or database corruption introduces a settlement referencing a non-member, both endpoints fail closed with `500 Internal Server Error` (`{ "error": "Internal server error" }`), ensuring corrupted data is never accounted for or enumerated to clients as valid group transactions.
+- Because there is no repair endpoint, a single corrupt row permanently 500s both `/balances` and `/settlements` for that group, and recovery is an out-of-band SQL/DBA operation.
 
 #### `POST /groups/:id/settle` — Record a Settlement (Debt Repayment)
 
@@ -479,7 +522,36 @@ Aliases accepted for `from` and `to`:
 
 #### `GET /groups/:id/settlements` — List Group Settlements
 
-Returns an array of all settlements recorded for the specified group, ordered by `date DESC, id DESC`. Returns `[]` if no settlements exist.
+Returns an array of all settlements recorded for the specified group, ordered by `date DESC, id DESC` (newest first). Returns `[]` if no settlements exist for the group.
+
+**Ordering & Determinism**:
+- Settlements are ordered chronologically descending by settlement `date DESC`.
+- Same-second ties are broken deterministically by `id DESC` (newest settlement ID first), matching the index `(group_id, date DESC, id DESC)`.
+
+**Response (`200 OK`)**:
+```json
+[
+  {
+    "id": 1,
+    "group_id": 1,
+    "from": 2,
+    "to": 1,
+    "from_user_id": 2,
+    "to_user_id": 1,
+    "from_name": "Bob",
+    "to_name": "Alice",
+    "amount": 2500,
+    "description": "Repaying dinner",
+    "date": "2026-09-11 20:00:00",
+    "created_at": "2026-09-11 20:00:00"
+  }
+]
+```
+
+**Error Responses (`400 Bad Request` / `404 Not Found` / `500 Internal Server Error`)**:
+- Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
+- Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
+- Corrupt settlement data / non-member participant: `500 Internal Server Error` `{ "error": "Internal server error" }`
 
 ## Balance Engine (`src/balances.ts`)
 

@@ -768,7 +768,7 @@ describe('Group Routes', () => {
       const res = await request(app).get(`/groups/${groupId}/balances`);
       expect(res.status).toBe(500);
       expect(res.body).toEqual({
-        error: expect.stringContaining('Conservation invariant violated'),
+        error: 'Internal server error',
       });
     });
 
