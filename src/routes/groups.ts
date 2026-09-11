@@ -168,7 +168,7 @@ export function parseId(raw: unknown): number | null {
     return Number.isSafeInteger(raw) && raw > 0 ? raw : null;
   }
   if (typeof raw === 'string') {
-    if (!/^\d+$/.test(raw)) {
+    if (!/^[1-9]\d*$/.test(raw)) {
       return null;
     }
     const num = Number(raw);
@@ -280,7 +280,10 @@ export function createGroupRouter(db: Database.Database): Router {
   const insertGroupStmt = db.prepare('INSERT INTO groups (name) VALUES (?)');
   const insertMemberStmt = db.prepare('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)');
   const selectUserById = db.prepare('SELECT id, name FROM users WHERE id = ?');
-  const selectUserByName = db.prepare('SELECT id, name FROM users WHERE name = ? COLLATE NOCASE');
+  const selectUserByName = db.prepare('SELECT id, name FROM users WHERE name = ? COLLATE NOCASE ORDER BY id ASC LIMIT 1');
+  const selectGroupMemberByName = db.prepare(
+    'SELECT u.id, u.name FROM users u JOIN group_members gm ON u.id = gm.user_id WHERE gm.group_id = ? AND u.name = ? COLLATE NOCASE ORDER BY u.id ASC LIMIT 1'
+  );
   const insertUserStmt = db.prepare('INSERT INTO users (name) VALUES (?)');
 
   const insertExpenseStmt = db.prepare(
@@ -515,14 +518,6 @@ export function createGroupRouter(db: Database.Database): Router {
           break;
         }
       }
-      if (raw === undefined) {
-        for (const key of aliasKeys) {
-          if (key in rec) {
-            raw = rec[key];
-            break;
-          }
-        }
-      }
     }
 
     if (raw === undefined || raw === null || raw === '') {
@@ -543,7 +538,7 @@ export function createGroupRouter(db: Database.Database): Router {
       if (!trimmed) {
         throw new ValidationError(`${roleLabel} name cannot be empty`);
       }
-      const user = selectUserByName.get(trimmed) as { id: number; name: string } | undefined;
+      const user = selectGroupMemberByName.get(groupId, trimmed) as { id: number; name: string } | undefined;
       if (!user) {
         throw new ValidationError(`${roleLabel} must be a member of the group`);
       }
@@ -564,7 +559,7 @@ export function createGroupRouter(db: Database.Database): Router {
         if (!trimmed) {
           throw new ValidationError(`${roleLabel} name cannot be empty`);
         }
-        const user = selectUserByName.get(trimmed) as { id: number; name: string } | undefined;
+        const user = selectGroupMemberByName.get(groupId, trimmed) as { id: number; name: string } | undefined;
         if (!user) {
           throw new ValidationError(`${roleLabel} must be a member of the group`);
         }
@@ -610,7 +605,7 @@ export function createGroupRouter(db: Database.Database): Router {
 
     const rawSplitType = body.split_type;
     let splitType: string | undefined;
-    if (rawSplitType !== undefined && rawSplitType !== null) {
+    if (rawSplitType !== undefined) {
       if (typeof rawSplitType !== 'string') {
         throw new ValidationError('split_type must be a string');
       }
@@ -685,6 +680,10 @@ export function createGroupRouter(db: Database.Database): Router {
       const entries = Object.entries(splitSource);
       if (entries.length === 0) {
         throw new ValidationError('Splits list cannot be empty');
+      }
+
+      if (splitType === 'equal') {
+        throw new ValidationError('Invalid split specification: unexpected split values for equal split');
       }
 
       let mode = explicitMode;
@@ -1147,6 +1146,17 @@ export function createGroupRouter(db: Database.Database): Router {
         to_name: string;
       }[];
 
+      const members = selectGroupMembers.all(groupId) as Member[];
+      const memberIdSet = new Set(members.map((m) => m.id));
+      for (const r of rows) {
+        if (!memberIdSet.has(r.from_user_id) || !memberIdSet.has(r.to_user_id)) {
+          throw new BalanceEngineError(
+            `Corrupt settlement ${r.id}: participant is not a member of group ${groupId}`,
+            'INVALID_USER_ID'
+          );
+        }
+      }
+
       const settlements: Settlement[] = rows.map((r) => ({
         id: r.id,
         group_id: r.group_id,
@@ -1202,6 +1212,16 @@ export function createGroupRouter(db: Database.Database): Router {
         to_name: string;
       }[];
 
+      const memberIdSet = new Set(members.map((m) => m.id));
+      for (const s of settlements) {
+        if (!memberIdSet.has(s.from_user_id) || !memberIdSet.has(s.to_user_id)) {
+          throw new BalanceEngineError(
+            `Corrupt settlement ${s.id}: participant is not a member of group ${groupId}`,
+            'INVALID_USER_ID'
+          );
+        }
+      }
+
       const settlementInputs: SettlementInput[] = settlements.map((s) => ({
         id: s.id,
         group_id: s.group_id,
@@ -1218,10 +1238,6 @@ export function createGroupRouter(db: Database.Database): Router {
       });
       res.status(200).json(summary);
     } catch (err) {
-      if (err instanceof BalanceEngineError) {
-        res.status(500).json({ error: err.message });
-        return;
-      }
       next(err);
     }
   });
