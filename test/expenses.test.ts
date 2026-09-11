@@ -10,6 +10,9 @@ import {
   isValidDate,
   calculateEqualSplits,
   ValidationError,
+  Member,
+  Expense,
+  ExpenseSplit,
 } from '../src/routes/groups';
 
 describe('Expense Routes - POST /groups/:id/expenses', () => {
@@ -634,6 +637,272 @@ describe('Expense Routes - POST /groups/:id/expenses', () => {
             db.exec('DROP TRIGGER abort_splits');
           });
       });
+    });
+  });
+
+  describe('GET /groups/:id/expenses - List group expenses', () => {
+    let groupId: number;
+    let aliceId: number;
+    let bobId: number;
+    let charlieId: number;
+
+    beforeEach(async () => {
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({
+          name: 'Weekend Getaway',
+          members: ['Alice', 'Bob', 'Charlie'],
+        });
+      groupId = groupRes.body.id;
+      aliceId = (groupRes.body.members as Member[]).find((m) => m.name === 'Alice')!.id;
+      bobId = (groupRes.body.members as Member[]).find((m) => m.name === 'Bob')!.id;
+      charlieId = (groupRes.body.members as Member[]).find((m) => m.name === 'Charlie')!.id;
+    });
+
+    it('returns empty array when group has no expenses', async () => {
+      const res = await request(app).get(`/groups/${groupId}/expenses`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([]);
+    });
+
+    it('returns 404 when group does not exist', async () => {
+      const res = await request(app).get('/groups/99999/expenses');
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: 'Group not found' });
+    });
+
+    it('returns 400 for malformed group IDs', async () => {
+      for (const badId of ['abc', '-1', '0', '1.5', 'true', 'null']) {
+        const res = await request(app).get(`/groups/${badId}/expenses`);
+        expect(res.status).toBe(400);
+        expect(res.body).toEqual({ error: 'Invalid group ID: must be a positive integer' });
+      }
+    });
+
+    it('round-trips create and list with matching response shape and split detail', async () => {
+      const createRes = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          description: 'Groceries',
+          paid_by: aliceId,
+          date: '2026-09-05 19:00:00',
+        });
+      expect(createRes.status).toBe(201);
+      const createdExpense = createRes.body;
+
+      const listRes = await request(app).get(`/groups/${groupId}/expenses`);
+      expect(listRes.status).toBe(200);
+      expect(Array.isArray(listRes.body)).toBe(true);
+      expect(listRes.body).toHaveLength(1);
+      expect(listRes.body[0]).toEqual(createdExpense);
+
+      // Verify exact fields
+      const item = listRes.body[0];
+      expect(item).toMatchObject({
+        id: createdExpense.id,
+        group_id: groupId,
+        paid_by: aliceId,
+        amount: 6000,
+        description: 'Groceries',
+        date: '2026-09-05 19:00:00',
+        created_at: expect.any(String),
+      });
+      expect(item.splits).toHaveLength(3);
+      expect(item.splits[0]).toEqual({
+        id: expect.any(Number),
+        expense_id: item.id,
+        user_id: aliceId,
+        user_name: 'Alice',
+        amount: 2000,
+        created_at: expect.any(String),
+      });
+      expect(item.splits[1]).toEqual({
+        id: expect.any(Number),
+        expense_id: item.id,
+        user_id: bobId,
+        user_name: 'Bob',
+        amount: 2000,
+        created_at: expect.any(String),
+      });
+      expect(item.splits[2]).toEqual({
+        id: expect.any(Number),
+        expense_id: item.id,
+        user_id: charlieId,
+        user_name: 'Charlie',
+        amount: 2000,
+        created_at: expect.any(String),
+      });
+    });
+
+    it('orders expenses by user-supplied date DESC, not created_at or id', async () => {
+      // Insert in deliberate order: oldest first, then newest, then middle
+      const expOld = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 1000,
+          description: 'Old expense',
+          paid_by: aliceId,
+          date: '2026-09-01 10:00:00',
+        });
+      const expNew = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 2000,
+          description: 'New expense',
+          paid_by: bobId,
+          date: '2026-09-05 10:00:00',
+        });
+      const expMid = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 3000,
+          description: 'Mid expense',
+          paid_by: charlieId,
+          date: '2026-09-03 10:00:00',
+        });
+
+      const listRes = await request(app).get(`/groups/${groupId}/expenses`);
+      expect(listRes.status).toBe(200);
+      const returnedIds = (listRes.body as Expense[]).map((e) => e.id);
+      // Newest date (Sep 5) -> Mid date (Sep 3) -> Old date (Sep 1)
+      expect(returnedIds).toEqual([expNew.body.id, expMid.body.id, expOld.body.id]);
+      expect((listRes.body as Expense[]).map((e) => e.date)).toEqual([
+        '2026-09-05 10:00:00',
+        '2026-09-03 10:00:00',
+        '2026-09-01 10:00:00',
+      ]);
+    });
+
+    it('breaks ties using id DESC when default CURRENT_TIMESTAMP timestamps share the same second', async () => {
+      // Create three expenses in rapid succession without specifying date
+      const exp1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 1000, paid_by: aliceId, description: 'First' });
+      const exp2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 2000, paid_by: bobId, description: 'Second' });
+      const exp3 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 3000, paid_by: charlieId, description: 'Third' });
+
+      expect(exp1.status).toBe(201);
+      expect(exp2.status).toBe(201);
+      expect(exp3.status).toBe(201);
+
+      // Verify they got the exact same timestamp string
+      expect(exp1.body.date).toBe(exp2.body.date);
+      expect(exp2.body.date).toBe(exp3.body.date);
+
+      const listRes = await request(app).get(`/groups/${groupId}/expenses`);
+      expect(listRes.status).toBe(200);
+      const returnedIds = (listRes.body as Expense[]).map((e) => e.id);
+      // Pinned same-second requirement: newest id DESC first
+      expect(returnedIds).toEqual([exp3.body.id, exp2.body.id, exp1.body.id]);
+    });
+
+    it('breaks ties using id DESC when expenses have identical user-specified timestamps', async () => {
+      const fixedTimestamp = '2026-09-05 12:00:00';
+      const exp1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 1000, paid_by: aliceId, date: fixedTimestamp, description: 'A' });
+      const exp2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 2000, paid_by: bobId, date: fixedTimestamp, description: 'B' });
+      const exp3 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 3000, paid_by: charlieId, date: fixedTimestamp, description: 'C' });
+      const exp4 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 4000, paid_by: aliceId, date: fixedTimestamp, description: 'D' });
+
+      const listRes = await request(app).get(`/groups/${groupId}/expenses`);
+      expect(listRes.status).toBe(200);
+      const returnedIds = (listRes.body as Expense[]).map((e) => e.id);
+      expect(returnedIds).toEqual([exp4.body.id, exp3.body.id, exp2.body.id, exp1.body.id]);
+    });
+
+    it('enforces id DESC tiebreak in query even if the composite date index is absent', async () => {
+      // Dropping the composite index verifies that the SQL query itself explicitly enforces
+      // ORDER BY date DESC, id DESC rather than accidentally inheriting index scan order
+      db.exec('DROP INDEX idx_expenses_group_id_date_id');
+
+      const fixedTimestamp = '2026-09-05 14:00:00';
+      const exp1 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 1000, paid_by: aliceId, date: fixedTimestamp, description: 'E1' });
+      const exp2 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 2000, paid_by: bobId, date: fixedTimestamp, description: 'E2' });
+      const exp3 = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 3000, paid_by: charlieId, date: fixedTimestamp, description: 'E3' });
+
+      const listRes = await request(app).get(`/groups/${groupId}/expenses`);
+      expect(listRes.status).toBe(200);
+      const returnedIds = (listRes.body as Expense[]).map((e) => e.id);
+      expect(returnedIds).toEqual([exp3.body.id, exp2.body.id, exp1.body.id]);
+    });
+
+    it('isolates expenses and splits by group so groups do not leak into each other', async () => {
+      const otherGroupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Other Group', members: ['Dave', 'Eve'] });
+      const otherGroupId = otherGroupRes.body.id;
+      const daveId = (otherGroupRes.body.members as Member[]).find((m) => m.name === 'Dave')!.id;
+
+      await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 1500, paid_by: aliceId, description: 'Group 1 Expense' });
+
+      await request(app)
+        .post(`/groups/${otherGroupId}/expenses`)
+        .send({ amount: 2500, paid_by: daveId, description: 'Group 2 Expense' });
+
+      const g1Res = await request(app).get(`/groups/${groupId}/expenses`);
+      const g2Res = await request(app).get(`/groups/${otherGroupId}/expenses`);
+
+      expect(g1Res.status).toBe(200);
+      expect(g2Res.status).toBe(200);
+      expect(g1Res.body).toHaveLength(1);
+      expect(g2Res.body).toHaveLength(1);
+      expect(g1Res.body[0].group_id).toBe(groupId);
+      expect(g1Res.body[0].description).toBe('Group 1 Expense');
+      expect(g1Res.body[0].splits).toHaveLength(3);
+      expect(g1Res.body[0].splits.reduce((acc: number, s: ExpenseSplit) => acc + s.amount, 0)).toBe(1500);
+
+      expect(g2Res.body[0].group_id).toBe(otherGroupId);
+      expect(g2Res.body[0].description).toBe('Group 2 Expense');
+      expect(g2Res.body[0].splits).toHaveLength(2);
+      expect(g2Res.body[0].splits.reduce((acc: number, s: ExpenseSplit) => acc + s.amount, 0)).toBe(2500);
+      expect(g2Res.body[0].splits.map((s: ExpenseSplit) => s.user_name).sort()).toEqual(['Dave', 'Eve']);
+    });
+
+    it('correctly associates splits across many expenses without per-expense queries', async () => {
+      for (let i = 1; i <= 5; i++) {
+        await request(app)
+          .post(`/groups/${groupId}/expenses`)
+          .send({
+            amount: i * 300,
+            paid_by: i % 2 === 0 ? bobId : aliceId,
+            description: `Expense ${i}`,
+            date: `2026-09-0${i} 12:00:00`,
+          });
+      }
+
+      const listRes = await request(app).get(`/groups/${groupId}/expenses`);
+      expect(listRes.status).toBe(200);
+      expect(listRes.body).toHaveLength(5);
+
+      for (const exp of listRes.body as Expense[]) {
+        expect(exp.splits).toHaveLength(3);
+        const splitSum = exp.splits.reduce((acc: number, s: ExpenseSplit) => acc + s.amount, 0);
+        expect(splitSum).toBe(exp.amount);
+        for (const s of exp.splits) {
+          expect(s.expense_id).toBe(exp.id);
+          expect(['Alice', 'Bob', 'Charlie']).toContain(s.user_name);
+        }
+      }
     });
   });
 });
