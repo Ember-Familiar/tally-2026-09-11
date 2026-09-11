@@ -342,6 +342,66 @@ Computes and returns the complete balance summary for a group, including per-use
 - Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
 - Corrupt data or invariant violation: `500 Internal Server Error` `{ "error": "<details>" }` (e.g., torn splits from direct SQLite cascade deletions where `sum(splits) < amount`, conservation violations, or integer overflow).
 
+### Settlements
+
+#### `POST /groups/:id/settle` — Record a Settlement (Debt Repayment)
+
+Records a debt repayment from one group member (`from` / payer) to another (`to` / payee). Settlements flow directly through to `GET /groups/:id/balances` using the pure balance engine's `options.settlements` path.
+
+**Contract & Invariants**:
+- Both parties must be members of the group.
+- A member cannot settle with themselves (`from !== to`).
+- Amount must be a positive safe integer in cents (`amount > 0`). Float amounts, strings, zero, and negative values are strictly rejected.
+- Recorded settlements reduce bilateral debts in `pairwise` and net balances in `balances`, while preserving zero-sum conservation ($\sum \text{net\_balance} = 0$).
+- Settlements do not increase `total_spend` (group spend represents true expenditures).
+
+**Request Body (`POST /groups/:id/settle`)**:
+```json
+{
+  "from": 2,
+  "to": 1,
+  "amount": 2000,
+  "description": "Cabin fee repayment",
+  "date": "2026-09-05 20:00:00"
+}
+```
+
+Aliases accepted for `from` and `to`:
+- `from`: `from`, `from_user_id`, `paid_by`, `payer_id`, `payer` (by ID number, case-insensitive user name string, or `{ id }` / `{ name }` object).
+- `to`: `to`, `to_user_id`, `paid_to`, `payee_id`, `payee`, `received_by` (by ID number, case-insensitive user name string, or `{ id }` / `{ name }` object).
+- `description` (optional, default `""`), `date` (optional `YYYY-MM-DD HH:MM:SS`, default SQLite `CURRENT_TIMESTAMP`).
+
+**Response (`201 Created`)**:
+```json
+{
+  "id": 1,
+  "group_id": 1,
+  "from": 2,
+  "to": 1,
+  "from_user_id": 2,
+  "to_user_id": 1,
+  "from_name": "Bob",
+  "to_name": "Alice",
+  "amount": 2000,
+  "description": "Cabin fee repayment",
+  "date": "2026-09-05 20:00:00",
+  "created_at": "2026-09-05 20:00:00"
+}
+```
+
+**Error Responses (`400 Bad Request` / `404 Not Found`)**:
+- Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
+- Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
+- Missing or invalid amount: `400 Bad Request` `{ "error": "Amount must be a positive integer in cents" }`
+- Missing payer / payee: `400 Bad Request` `{ "error": "Payer is required" }` / `{ "error": "Payee is required" }`
+- Payer or payee not in group: `400 Bad Request` `{ "error": "Payer must be a member of the group" }` / `{ "error": "Payee must be a member of the group" }`
+- Self-settlement: `400 Bad Request` `{ "error": "Cannot settle with self" }`
+- Invalid date format: `400 Bad Request` `{ "error": "Invalid date format: must be YYYY-MM-DD HH:MM:SS" }`
+
+#### `GET /groups/:id/settlements` — List Group Settlements
+
+Returns an array of all settlements recorded for the specified group, ordered by `date DESC, id DESC`. Returns `[]` if no settlements exist.
+
 ## Balance Engine (`src/balances.ts`)
 
 Pure, unit-tested balance calculation engine and deterministic debt simplification using strict integer-cent arithmetic.

@@ -17,6 +17,7 @@ export {
   parseAmount,
   parseDescription,
   calculateEqualSplits,
+  Settlement,
 } from './routes/groups';
 export { createServer, resolveDbPath, parsePort, DEFAULT_DB_PATH } from './server';
 export {

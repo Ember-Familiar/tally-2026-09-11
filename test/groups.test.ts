@@ -805,8 +805,8 @@ describe('Group Routes', () => {
       try {
         const res = await request(app).get(`/groups/${groupId}/balances`);
         expect(res.status).toBe(200);
-        // Expect exactly 4 queries: group existence check, members select, expenses select, splits select
-        expect(queryCount).toBe(4);
+        // Expect exactly 5 queries: group existence check, members select, expenses select, splits select, settlements select
+        expect(queryCount).toBe(5);
       } finally {
         stmtProto.all = originalAll;
         stmtProto.get = originalGet;
