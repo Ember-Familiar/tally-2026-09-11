@@ -1,5 +1,5 @@
-# tally-2026-09-05
-Tally expense-splitting test bed — 2026-09-05 multi-model and prerequisite-dependency rerun
+# tally-2026-09-11
+Strict-head obligation handling Tally dogfood run (2026-09-11)
 
 ## Database & Migrations
 
@@ -89,7 +89,7 @@ Creates a group with a name and initial members in a single SQLite transaction.
 {
   "id": 1,
   "name": "Ski Trip",
-  "created_at": "2026-09-05 18:25:00",
+  "created_at": "2026-09-11 19:25:00",
   "members": [
     { "id": 1, "name": "Alice" },
     { "id": 2, "name": "Bob" },
@@ -119,7 +119,7 @@ Returns an array of all groups, each with their member list, ordered by `id ASC`
   {
     "id": 1,
     "name": "Ski Trip",
-    "created_at": "2026-09-05 18:25:00",
+    "created_at": "2026-09-11 19:25:00",
     "members": [
       { "id": 1, "name": "Alice" },
       { "id": 2, "name": "Bob" }
@@ -137,7 +137,7 @@ Returns a single group with its members by group ID.
 {
   "id": 1,
   "name": "Ski Trip",
-  "created_at": "2026-09-05 18:25:00",
+  "created_at": "2026-09-11 19:25:00",
   "members": [
     { "id": 1, "name": "Alice" },
     { "id": 2, "name": "Bob" }
@@ -258,8 +258,8 @@ Callers may specify custom splits using one of three modes:
   "paid_by": 1,
   "amount": 6000,
   "description": "Dinner",
-  "date": "2026-09-05 19:00:00",
-  "created_at": "2026-09-05 19:00:00",
+  "date": "2026-09-11 19:00:00",
+  "created_at": "2026-09-11 19:00:00",
   "splits": [
     {
       "id": 1,
@@ -267,7 +267,7 @@ Callers may specify custom splits using one of three modes:
       "user_id": 1,
       "user_name": "Alice",
       "amount": 4000,
-      "created_at": "2026-09-05 19:00:00"
+      "created_at": "2026-09-11 19:00:00"
     },
     {
       "id": 2,
@@ -275,7 +275,7 @@ Callers may specify custom splits using one of three modes:
       "user_id": 2,
       "user_name": "Bob",
       "amount": 2000,
-      "created_at": "2026-09-05 19:00:00"
+      "created_at": "2026-09-11 19:00:00"
     }
   ]
 }
@@ -324,8 +324,8 @@ Returns an array of all expenses recorded for the specified group, each includin
     "paid_by": 1,
     "amount": 6000,
     "description": "Groceries",
-    "date": "2026-09-05 19:00:00",
-    "created_at": "2026-09-05 19:00:00",
+    "date": "2026-09-11 19:00:00",
+    "created_at": "2026-09-11 19:00:00",
     "splits": [
       {
         "id": 1,
@@ -333,7 +333,7 @@ Returns an array of all expenses recorded for the specified group, each includin
         "user_id": 1,
         "user_name": "Alice",
         "amount": 2000,
-        "created_at": "2026-09-05 19:00:00"
+        "created_at": "2026-09-11 19:00:00"
       },
       {
         "id": 2,
@@ -341,7 +341,7 @@ Returns an array of all expenses recorded for the specified group, each includin
         "user_id": 2,
         "user_name": "Bob",
         "amount": 2000,
-        "created_at": "2026-09-05 19:00:00"
+        "created_at": "2026-09-11 19:00:00"
       },
       {
         "id": 3,
@@ -349,7 +349,7 @@ Returns an array of all expenses recorded for the specified group, each includin
         "user_id": 3,
         "user_name": "Charlie",
         "amount": 2000,
-        "created_at": "2026-09-05 19:00:00"
+        "created_at": "2026-09-11 19:00:00"
       }
     ]
   }
@@ -542,8 +542,8 @@ Returns an array of all settlements recorded for the specified group, ordered by
     "to_name": "Alice",
     "amount": 2500,
     "description": "Repaying dinner",
-    "date": "2026-09-05 20:00:00",
-    "created_at": "2026-09-05 20:00:00"
+    "date": "2026-09-11 20:00:00",
+    "created_at": "2026-09-11 20:00:00"
   }
 ]
 ```
