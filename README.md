@@ -1,6 +1,32 @@
 # tally-2026-09-11
 Strict-head obligation handling Tally dogfood run (2026-09-11)
 
+## Quickstart
+
+To get up and running from a fresh repository clone:
+
+```bash
+# 1. Install dependencies
+npm ci
+
+# 2. Run SQLite migrations (creates tally.db by default)
+npm run migrate
+
+# 3. Start the server (defaults to port 3000)
+npm start
+```
+
+Both `npm run migrate` and `npm start` automatically compile TypeScript sources to `dist/` via `premigrate` and `prestart` npm scripts. You can also build explicitly with `npm run build`.
+
+## Money Model: Strict Integer Cents
+
+All currency amounts in Tally are strictly represented and calculated as positive safe integers in **cents** (1/100 of a currency unit). Floating-point values (such as `10.50` or `0.01`) are forbidden across all APIs and internal engines to eliminate floating-point rounding errors and precision loss.
+
+- **API Payloads**: Amounts are passed as integer cents (e.g. `1000` represents $10.00).
+- **Balance Engine**: All summations, debt settlements, and pairwise calculations use integer-cent checked arithmetic (`checkedAdd`, `checkedSub`) with arbitrary-precision `BigInt` conservation invariants and overflow protection.
+- **CSV Export**: Amounts are expressed in explicit integer cents with self-describing column headers (`amount_cents`, `split_<member>_cents`).
+- **Web UI**: Cents are formatted for display using `formatCents` ($10.00), while the underlying state and network exchanges remain strictly integer cents.
+
 ## Database & Migrations
 
 To run database migrations:
@@ -566,6 +592,56 @@ Returns an array of all settlements recorded for the specified group, ordered by
 - Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
 - Corrupt settlement data / non-member participant: `500 Internal Server Error` `{ "error": "Internal server error" }`
 
+### CSV Export
+
+#### `GET /groups/:id/export.csv` — Export Group Expenses as CSV
+
+Exports all expenses recorded for the specified group as an RFC 4180 compliant CSV document with safe spreadsheet formula injection mitigation and self-describing integer-cent headers.
+
+**Contract & Properties**:
+- **Ordering & Determinism**: Expenses are ordered newest expense date first (`date DESC`), with same-second ties broken deterministically by `id DESC` (newest expense ID first), matching Task 5's `GET /groups/:id/expenses` query and composite index `(group_id, date DESC, id DESC)`.
+- **Row Shape (Per-Member Columns)**:
+  - Each expense is represented as exactly one row.
+  - The header row begins with common expense fields (`id,date,description,paid_by,payer_name,amount_cents`), followed by one dedicated split column per group member (`split_<member_name>_cents`), ordered deterministically by `user_id ASC`.
+  - **Design Rationale**: A wide per-member columns layout was selected because:
+    1. It preserves a strict one-row-per-expense structure, acting as a clean transactional ledger.
+    2. Summing the `amount_cents` column in spreadsheet applications (e.g. Excel, Numbers, Google Sheets) yields the true total group spend without artificial inflation from duplicate expense rows.
+    3. Each member's total allocated share can be computed directly using simple column summation formulas (e.g. `=SUM(G2:G10)`).
+    4. Custom and unequal splits (e.g. subset splits where non-participating members owe 0 cents) are clearly and transparently visible per member.
+- **RFC 4180 Quoting & Escaping**:
+  - Fields containing commas (`,`), double quotes (`"`), carriage returns (`\r`), or line feeds (`\n`) are enclosed in double quotes.
+  - Any double quotes appearing within a field are escaped by doubling them (`""`).
+- **Spreadsheet Formula Injection Defense (CWE-1236)**:
+  - To prevent formula execution when opening exported CSV files in spreadsheet applications, any field beginning with `=`, `+`, `-`, `@`, tab (`\t`), or carriage return (`\r`) is automatically prefixed with a single quote (`'`), safely neutralizing it as plain text.
+- **Headers**:
+  - `Content-Type: text/csv; charset=utf-8`
+  - `Content-Disposition: attachment; filename="group-<id>-expenses.csv"`
+- **Empty Group**:
+  - If a group has no expenses, returns `200 OK` with the complete CSV header row (including all member split columns) and zero data rows.
+
+**Worked Example**:
+
+Request:
+```bash
+curl -i http://localhost:3000/groups/1/export.csv
+```
+
+Response:
+```http
+HTTP/1.1 200 OK
+Content-Type: text/csv; charset=utf-8
+Content-Disposition: attachment; filename="group-1-expenses.csv"
+
+id,date,description,paid_by,payer_name,amount_cents,split_Alice_cents,split_Bob_cents
+2,2026-09-11 21:00:00,'=cmd|'/c calc'!A1,1,Alice,1500,750,750
+1,2026-09-11 20:00:00,"He said ""hi"", then left
+second line",1,Alice,4500,2250,2250
+```
+
+**Error Responses (`400 Bad Request` / `404 Not Found`)**:
+- Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
+- Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }` (e.g. `/groups/abc/export.csv`, `/groups/-1/export.csv`, `/groups/01/export.csv`).
+
 ## Balance Engine (`src/balances.ts`)
 
 Pure, unit-tested balance calculation engine and deterministic debt simplification using strict integer-cent arithmetic.
@@ -713,4 +789,61 @@ const summary = calculateBalances(groupExpenses, { members: groupMembers });
 // summary.settlements -> simplified transfers
 // summary.pairwise -> bilateral pairwise debts
 // summary.total_spend -> total expenses amount in cents
+```
+
+## Development & Quality Gates
+
+Run the test suite and quality verification gates from the repository root:
+
+```bash
+# Run the full Vitest test suite
+npm test
+
+# Verify tests run directly against source with zero dist build artifacts required or created
+rm -rf dist && npm test && test ! -d dist
+
+# Run TypeScript typechecks across source and test files
+npm run typecheck
+
+# Run ESLint across codebase
+npm run lint
+
+# Compile TypeScript to dist/
+npm run build
+```
+
+## Project Layout
+
+```
+.
+├── src/
+│   ├── index.ts          # Barrel re-exporting app, createDatabase, runMigrations, runCliMigrations, groups router, server helpers, and balances
+│   ├── app.ts            # Express application setup, static UI serving, and centralized error handling
+│   ├── server.ts         # Server entrypoint listening on configured port
+│   ├── db.ts             # SQLite database connection helper with WAL mode and foreign keys
+│   ├── migrations.ts     # Migration runner applying SQL schema files in order
+│   ├── migrate.ts        # CLI migration runner
+│   ├── balances.ts       # Pure integer-cent balance engine, split calculators, and debt simplification
+│   ├── csv.ts            # RFC 4180 CSV serialization, escaping, and formula injection defense
+│   └── routes/
+│       └── groups.ts     # Express routes for groups, expenses, balances, settlements, and CSV export
+├── migrations/
+│   ├── 001_initial_schema.sql  # Initial schema: users, groups, group_members, expenses, expense_splits
+│   └── 002_settlements.sql     # Settlements schema and composite performance indexes
+├── public/               # Browser SPA UI assets (served at /)
+│   ├── index.html        # Single-page application markup
+│   ├── style.css         # Modern, accessible styles
+│   └── app.js            # Client-side SPA logic using safe DOM primitives
+└── test/                 # Vitest test suite across all subsystems
+    ├── balances.test.ts    # Balance engine, split calculations, and debt simplification tests
+    ├── db.test.ts          # SQLite connection and pragma tests
+    ├── expenses.test.ts    # Expense creation, split validation, and listing tests
+    ├── export.test.ts      # CSV export, RFC 4180 quoting, and formula injection tests
+    ├── groups.test.ts      # Group creation and group detail tests
+    ├── health.test.ts      # Health check endpoint tests
+    ├── migrations.test.ts  # Database migration runner tests
+    ├── server.test.ts      # Server lifecycle and configuration tests
+    ├── settle.test.ts      # Settlement recording and balance reflection tests
+    ├── ui.test.ts          # Static UI serving and client DOM safety tests
+    └── validation.test.ts  # Cross-endpoint validation and consistent 4xx error contract tests
 ```
