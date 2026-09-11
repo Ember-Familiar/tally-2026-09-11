@@ -1,2 +1,4 @@
 export { app, createApp } from './app';
-export { createDatabase } from './db';
+export { createDatabase, DatabaseOptions } from './db';
+export { runMigrations } from './migrations';
+export { runCliMigrations } from './migrate';
