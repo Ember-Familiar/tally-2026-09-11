@@ -34,6 +34,8 @@ The interface provides:
 - **Group Management**: Create new groups with initial members and view all existing groups with member badges and creation dates.
 - **Add-Expense Form**: Record new shared expenses against `POST /groups/:id/expenses` with description, integer-cent amount, payer (name or ID), and optional custom timestamp, split equally across group members.
 - **Expense History**: View recorded expenses for any group via `GET /groups/:id/expenses` ordered newest expense date first (`date DESC, id DESC`), complete with formatted dollar amounts, payer information, date, and individual split allocations.
+- **Balances View**: View per-member net positions (paid, owed, and net balance) alongside simplified settlement suggestions via `GET /groups/:id/balances`, with currency amounts formatted from integer cents via `formatCents`.
+- **Settle-Up Action**: Record direct debt repayments between group members via `POST /groups/:id/settle` with inline validation feedback and automatic balances reload without page refresh. Also supports one-click prefill directly from settlement suggestion cards.
 - **Feedback & Validation**: Inline feedback banners for success notifications and server-rejected validation error messages (e.g. missing amount, non-member payer, invalid dates).
 - **Safe DOM Discipline**: All dynamic UI nodes are generated using safe DOM primitives (`document.createElement`, `element.textContent`, `element.appendChild`, `element.replaceChildren`), strictly forbidding unsafe sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`) to guarantee complete immunity from script/markup injection.
 

@@ -170,6 +170,124 @@
         <div id="expenses-status-container"></div>
         <div id="expenses-list" class="expenses-grid" aria-live="polite"></div>
       </section>
+
+      <!-- Balances & Settle Up Section -->
+      <section class="card" id="balances-section">
+        <div class="card-header-actions">
+          <div>
+            <h2 class="card-title" id="balances-title">Group Balances</h2>
+            <p class="card-subtitle" id="balances-subtitle">View member balances and settle up debts.</p>
+          </div>
+          <button type="button" id="refresh-balances-btn" class="btn btn-secondary btn-sm" title="Refresh balances">
+            🔄 Refresh
+          </button>
+        </div>
+
+        <div id="balances-status-container"></div>
+
+        <div id="balances-content" class="balances-content hidden">
+          <!-- Member Net Positions -->
+          <div class="balances-list-header">
+            <h3 class="subsection-title">Member Balances</h3>
+          </div>
+          <div id="member-balances-list" class="balances-grid" aria-live="polite"></div>
+
+          <hr class="section-divider">
+
+          <!-- Settlement Suggestions -->
+          <div class="settlements-header">
+            <h3 class="subsection-title">Settlement Suggestions</h3>
+          </div>
+          <div id="settlements-status-container"></div>
+          <div id="settlements-list" class="settlements-grid" aria-live="polite"></div>
+
+          <hr class="section-divider">
+
+          <!-- Settle Up Form -->
+          <div class="settle-form-header">
+            <h3 class="subsection-title">Record a Settlement</h3>
+            <p class="card-subtitle">Record a direct debt payment between two group members.</p>
+          </div>
+
+          <form id="settle-up-form" class="form" novalidate>
+            <div class="form-row">
+              <div class="form-group form-col">
+                <label for="settle-payer" class="form-label">From (Payer) <span class="required">*</span></label>
+                <input
+                  type="text"
+                  id="settle-payer"
+                  name="from"
+                  class="form-input"
+                  placeholder="Member name or ID (e.g. Bob)"
+                  required
+                >
+                <span class="form-hint">Must be an existing member of the group.</span>
+              </div>
+
+              <div class="form-group form-col">
+                <label for="settle-payee" class="form-label">To (Payee) <span class="required">*</span></label>
+                <input
+                  type="text"
+                  id="settle-payee"
+                  name="to"
+                  class="form-input"
+                  placeholder="Member name or ID (e.g. Alice)"
+                  required
+                >
+                <span class="form-hint">Must be an existing member of the group.</span>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group form-col">
+                <label for="settle-amount" class="form-label">Amount (cents) <span class="required">*</span></label>
+                <input
+                  type="text"
+                  id="settle-amount"
+                  name="amount"
+                  class="form-input"
+                  placeholder="e.g. 2000 for $20.00"
+                  inputmode="numeric"
+                  required
+                >
+                <span class="form-hint">Enter integer cents (e.g. 2000 = $20.00).</span>
+              </div>
+
+              <div class="form-group form-col">
+                <label for="settle-date" class="form-label">Date</label>
+                <input
+                  type="text"
+                  id="settle-date"
+                  name="date"
+                  class="form-input"
+                  placeholder="YYYY-MM-DD HH:MM:SS (optional, defaults to now)"
+                >
+                <span class="form-hint">Format: YYYY-MM-DD HH:MM:SS (leave blank for current time).</span>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="settle-description" class="form-label">Description</label>
+              <input
+                type="text"
+                id="settle-description"
+                name="description"
+                class="form-input"
+                placeholder="e.g. Repayment (optional)"
+                maxlength="255"
+              >
+            </div>
+
+            <div id="settle-feedback" class="feedback-message hidden" role="alert"></div>
+
+            <div class="form-actions">
+              <button type="submit" id="settle-btn" class="btn btn-primary">
+                <span class="btn-text">Record Settlement</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      </section>
     </main>
 
     <footer class="app-footer">
