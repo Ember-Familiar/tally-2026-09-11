@@ -1,11 +1,17 @@
 import { app } from './app';
 
-const rawPort = process.env.PORT || '3000';
-const PORT = parseInt(rawPort, 10);
-if (Number.isNaN(PORT) || PORT <= 0) {
-  throw new Error(`Invalid PORT environment variable: ${rawPort}`);
+export function parsePort(rawPort: string | undefined): number {
+  const portStr = rawPort || '3000';
+  const port = Number(portStr);
+  if (!/^\d+$/.test(portStr) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid PORT environment variable: ${portStr}`);
+  }
+  return port;
 }
 
-app.listen(PORT, () => {
-  console.log(`Tally server listening on port ${PORT}`);
-});
+if (require.main === module) {
+  const PORT = parsePort(process.env.PORT);
+  app.listen(PORT, () => {
+    console.log(`Tally server listening on port ${PORT}`);
+  });
+}

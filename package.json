@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "migrate": "node dist/migrate.js",
     "start": "node dist/server.js"
   },
   "dependencies": {
