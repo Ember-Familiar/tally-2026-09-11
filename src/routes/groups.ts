@@ -278,6 +278,50 @@ export function createGroupRouter(db: Database.Database): Router {
   const checkMembershipStmt = db.prepare(
     'SELECT user_id FROM group_members WHERE group_id = ? AND user_id = ?'
   );
+  const selectExpensesByGroupId = db.prepare(
+    'SELECT id, group_id, paid_by, amount, description, date, created_at FROM expenses WHERE group_id = ? ORDER BY date DESC, id DESC'
+  );
+  const selectSplitsByGroupId = db.prepare(
+    'SELECT es.id, es.expense_id, es.user_id, u.name as user_name, es.amount, es.created_at FROM expense_splits es JOIN users u ON es.user_id = u.id JOIN expenses e ON es.expense_id = e.id WHERE e.group_id = ? ORDER BY es.id ASC'
+  );
+
+  function getGroupExpensesWithSplits(groupId: number): Expense[] {
+    const expenses = selectExpensesByGroupId.all(groupId) as {
+      id: number;
+      group_id: number;
+      paid_by: number;
+      amount: number;
+      description: string;
+      date: string;
+      created_at: string;
+    }[];
+
+    if (expenses.length === 0) {
+      return [];
+    }
+
+    const splits = selectSplitsByGroupId.all(groupId) as ExpenseSplit[];
+    const splitsByExpenseId = new Map<number, ExpenseSplit[]>();
+    for (const split of splits) {
+      let list = splitsByExpenseId.get(split.expense_id);
+      if (!list) {
+        list = [];
+        splitsByExpenseId.set(split.expense_id, list);
+      }
+      list.push(split);
+    }
+
+    return expenses.map((exp) => ({
+      id: exp.id,
+      group_id: exp.group_id,
+      paid_by: exp.paid_by,
+      amount: exp.amount,
+      description: exp.description,
+      date: exp.date,
+      created_at: exp.created_at,
+      splits: splitsByExpenseId.get(exp.id) ?? [],
+    }));
+  }
 
   const createExpenseTransaction = db.transaction(
     (
@@ -567,6 +611,29 @@ export function createGroupRouter(db: Database.Database): Router {
         res.status(400).json({ error: err.message });
         return;
       }
+      next(err);
+    }
+  });
+
+  // GET /groups/:id/expenses - List all expenses for a group
+  router.get('/:id/expenses', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const rawId = req.params.id;
+      const groupId = parseId(rawId);
+      if (groupId === null) {
+        res.status(400).json({ error: 'Invalid group ID: must be a positive integer' });
+        return;
+      }
+
+      const group = selectGroupById.get(groupId);
+      if (!group) {
+        res.status(404).json({ error: 'Group not found' });
+        return;
+      }
+
+      const expenses = getGroupExpensesWithSplits(groupId);
+      res.status(200).json(expenses);
+    } catch (err) {
       next(err);
     }
   });

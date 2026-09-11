@@ -190,3 +190,57 @@ Creates an expense for a group with an exact integer-cent equal split among all 
   ]
 }
 ```
+
+#### `GET /groups/:id/expenses` — List Group Expenses
+
+Returns an array of all expenses recorded for the specified group, each including full payer and split details.
+
+**Ordering & Same-Second Tiebreak**:
+- Expenses are returned ordered by expense date descending (`date DESC`), newest expense date first. This ordering uses the user-supplied `expenses.date`, not `created_at`.
+- Because SQLite's default `CURRENT_TIMESTAMP` has one-second resolution, expenses recorded within the same second share an identical date string. Ties on date are broken deterministically by `id DESC` (newest expense ID first), utilizing the composite index `(group_id, date DESC, id DESC)`.
+
+**Response (`200 OK`)**:
+```json
+[
+  {
+    "id": 1,
+    "group_id": 1,
+    "paid_by": 1,
+    "amount": 6000,
+    "description": "Groceries",
+    "date": "2026-09-11 19:00:00",
+    "created_at": "2026-09-11 19:00:00",
+    "splits": [
+      {
+        "id": 1,
+        "expense_id": 1,
+        "user_id": 1,
+        "user_name": "Alice",
+        "amount": 2000,
+        "created_at": "2026-09-11 19:00:00"
+      },
+      {
+        "id": 2,
+        "expense_id": 1,
+        "user_id": 2,
+        "user_name": "Bob",
+        "amount": 2000,
+        "created_at": "2026-09-11 19:00:00"
+      },
+      {
+        "id": 3,
+        "expense_id": 1,
+        "user_id": 3,
+        "user_name": "Charlie",
+        "amount": 2000,
+        "created_at": "2026-09-11 19:00:00"
+      }
+    ]
+  }
+]
+```
+If the group has no expenses, returns `200 OK` with an empty array `[]`.
+
+**Error Responses (`400 Bad Request` / `404 Not Found`)**:
+- Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
+- Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
