@@ -1,0 +1,32 @@
+{
+  "name": "tally",
+  "version": "0.1.0",
+  "description": "Tally expense-splitting service",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.21.0",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.13.3",
+    "@types/supertest": "^6.0.2",
+    "eslint": "^9.21.0",
+    "supertest": "^7.0.0",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.25.0",
+    "vitest": "^3.0.7"
+  }
+}
