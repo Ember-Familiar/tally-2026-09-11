@@ -11,6 +11,7 @@ import {
   RatioSplitItem,
   PercentageSplitItem,
 } from '../balances';
+import { formatGroupExpensesCsv } from '../csv';
 
 export interface Settlement {
   id: number;
@@ -1035,6 +1036,38 @@ export function createGroupRouter(db: Database.Database): Router {
 
       const expenses = getGroupExpensesWithSplits(groupId);
       res.status(200).json(expenses);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /groups/:id/export.csv - Export group expenses as RFC 4180 CSV
+  router.get('/:id/export.csv', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const rawId = req.params.id;
+      const groupId = parseId(rawId);
+      if (groupId === null) {
+        res.status(400).json({ error: 'Invalid group ID: must be a positive integer' });
+        return;
+      }
+
+      const group = selectGroupById.get(groupId) as { id: number; name: string; created_at: string } | undefined;
+      if (!group) {
+        res.status(404).json({ error: 'Group not found' });
+        return;
+      }
+
+      const expenses = getGroupExpensesWithSplits(groupId);
+      const members = selectGroupMembers.all(groupId) as Member[];
+
+      const csv = formatGroupExpensesCsv(
+        { id: group.id, name: group.name, members },
+        expenses
+      );
+
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="group-${groupId}-expenses.csv"`);
+      res.status(200).send(csv);
     } catch (err) {
       next(err);
     }
