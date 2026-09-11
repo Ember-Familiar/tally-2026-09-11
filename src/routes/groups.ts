@@ -1,6 +1,21 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import Database from 'better-sqlite3';
-import { calculateBalances, BalanceEngineError } from '../balances';
+import { calculateBalances, BalanceEngineError, SettlementInput } from '../balances';
+
+export interface Settlement {
+  id: number;
+  group_id: number;
+  from: number;
+  to: number;
+  from_user_id: number;
+  to_user_id: number;
+  from_name: string;
+  to_name: string;
+  amount: number;
+  description: string;
+  date: string;
+  created_at: string;
+}
 
 export interface Member {
   id: number;
@@ -285,6 +300,29 @@ export function createGroupRouter(db: Database.Database): Router {
   const selectSplitsByGroupId = db.prepare(
     'SELECT es.id, es.expense_id, es.user_id, u.name as user_name, es.amount, es.created_at FROM expense_splits es JOIN users u ON es.user_id = u.id JOIN expenses e ON es.expense_id = e.id WHERE e.group_id = ? ORDER BY es.id ASC'
   );
+  const insertSettlementStmt = db.prepare(
+    'INSERT INTO settlements (group_id, from_user_id, to_user_id, amount, description) VALUES (?, ?, ?, ?, ?)'
+  );
+  const insertSettlementWithDateStmt = db.prepare(
+    'INSERT INTO settlements (group_id, from_user_id, to_user_id, amount, description, date) VALUES (?, ?, ?, ?, ?, ?)'
+  );
+  const selectSettlementById = db.prepare(
+    `SELECT s.id, s.group_id, s.from_user_id, s.to_user_id, s.amount, s.description, s.date, s.created_at,
+            u1.name as from_name, u2.name as to_name
+     FROM settlements s
+     JOIN users u1 ON s.from_user_id = u1.id
+     JOIN users u2 ON s.to_user_id = u2.id
+     WHERE s.id = ?`
+  );
+  const selectSettlementsByGroupId = db.prepare(
+    `SELECT s.id, s.group_id, s.from_user_id, s.to_user_id, s.amount, s.description, s.date, s.created_at,
+            u1.name as from_name, u2.name as to_name
+     FROM settlements s
+     JOIN users u1 ON s.from_user_id = u1.id
+     JOIN users u2 ON s.to_user_id = u2.id
+     WHERE s.group_id = ?
+     ORDER BY s.date DESC, s.id DESC`
+  );
 
   function getGroupExpensesWithSplits(groupId: number): Expense[] {
     const expenses = selectExpensesByGroupId.all(groupId) as {
@@ -421,6 +459,96 @@ export function createGroupRouter(db: Database.Database): Router {
     }
   );
 
+  const EXPENSE_PAYER_ALIASES = ['paid_by', 'payer_id', 'payer'];
+  const SETTLE_FROM_ALIASES = ['from', 'from_user_id', 'paid_by', 'payer_id', 'payer'];
+  const SETTLE_TO_ALIASES = ['to', 'to_user_id', 'paid_to', 'payee_id', 'payee', 'received_by'];
+
+  function resolveGroupParticipant(
+    rawOrBody: unknown,
+    roleLabel: string,
+    groupId: number,
+    aliasKeys?: string[],
+  ): number {
+    let raw = rawOrBody;
+    if (aliasKeys && rawOrBody && typeof rawOrBody === 'object' && !Array.isArray(rawOrBody)) {
+      const rec = rawOrBody as Record<string, unknown>;
+      raw = undefined;
+      for (const key of aliasKeys) {
+        if (rec[key] !== undefined && rec[key] !== null) {
+          raw = rec[key];
+          break;
+        }
+      }
+      if (raw === undefined) {
+        for (const key of aliasKeys) {
+          if (key in rec) {
+            raw = rec[key];
+            break;
+          }
+        }
+      }
+    }
+
+    if (raw === undefined || raw === null || raw === '') {
+      throw new ValidationError(`${roleLabel} is required`);
+    }
+
+    const roleLower = roleLabel.toLowerCase();
+    let userId: number;
+
+    if (typeof raw === 'number') {
+      const parsed = parseId(raw);
+      if (parsed === null) {
+        throw new ValidationError(`Invalid ${roleLower} ID: must be a positive integer`);
+      }
+      userId = parsed;
+    } else if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        throw new ValidationError(`${roleLabel} name cannot be empty`);
+      }
+      const user = selectUserByName.get(trimmed) as { id: number; name: string } | undefined;
+      if (!user) {
+        throw new ValidationError(`${roleLabel} must be a member of the group`);
+      }
+      userId = user.id;
+    } else if (typeof raw === 'object' && !Array.isArray(raw)) {
+      const obj = raw as Record<string, unknown>;
+      if (obj.id !== undefined && obj.id !== null) {
+        const parsed = parseId(obj.id);
+        if (parsed === null) {
+          throw new ValidationError(`Invalid ${roleLower} ID: must be a positive integer`);
+        }
+        userId = parsed;
+      } else if (obj.name !== undefined && obj.name !== null) {
+        if (typeof obj.name !== 'string') {
+          throw new ValidationError(`${roleLabel} name must be a string`);
+        }
+        const trimmed = obj.name.trim();
+        if (!trimmed) {
+          throw new ValidationError(`${roleLabel} name cannot be empty`);
+        }
+        const user = selectUserByName.get(trimmed) as { id: number; name: string } | undefined;
+        if (!user) {
+          throw new ValidationError(`${roleLabel} must be a member of the group`);
+        }
+        userId = user.id;
+      } else {
+        throw new ValidationError(`Invalid ${roleLower} format`);
+      }
+    } else {
+      throw new ValidationError(`Invalid ${roleLower} format`);
+    }
+
+    // Check that participant is a member of this group
+    const isMember = checkMembershipStmt.get(groupId, userId);
+    if (!isMember) {
+      throw new ValidationError(`${roleLabel} must be a member of the group`);
+    }
+
+    return userId;
+  }
+
   // POST /groups - Create group with name and initial members
   router.post('/', (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -482,23 +610,23 @@ export function createGroupRouter(db: Database.Database): Router {
     }
   });
 
-  // GET /groups/:id - Detail for a single group
+  // GET /groups/:id - Get group by id
   router.get('/:id', (req: Request, res: Response, next: NextFunction) => {
     try {
       const rawId = req.params.id;
-      const groupId = parseId(rawId);
-      if (groupId === null) {
+      const id = parseId(rawId);
+      if (id === null) {
         res.status(400).json({ error: 'Invalid group ID: must be a positive integer' });
         return;
       }
 
-      const group = selectGroupById.get(groupId) as { id: number; name: string; created_at: string } | undefined;
+      const group = selectGroupById.get(id) as { id: number; name: string; created_at: string } | undefined;
       if (!group) {
         res.status(404).json({ error: 'Group not found' });
         return;
       }
 
-      const members = selectGroupMembers.all(groupId) as Member[];
+      const members = selectGroupMembers.all(id) as Member[];
       res.status(200).json({
         id: group.id,
         name: group.name,
@@ -510,7 +638,7 @@ export function createGroupRouter(db: Database.Database): Router {
     }
   });
 
-  // POST /groups/:id/expenses - Add an expense with equal split among group members
+  // POST /groups/:id/expenses - Add an expense to a group with equal split
   router.post('/:id/expenses', (req: Request, res: Response, next: NextFunction) => {
     try {
       const rawId = req.params.id;
@@ -531,72 +659,7 @@ export function createGroupRouter(db: Database.Database): Router {
       const description = parseDescription(body.description);
       const date = parseDate(body.date);
 
-      const rawPayer = body.paid_by ?? body.payer_id ?? body.payer;
-      if (rawPayer === undefined || rawPayer === null || rawPayer === '') {
-        res.status(400).json({ error: 'Payer is required' });
-        return;
-      }
-
-      let payerUserId: number;
-      if (typeof rawPayer === 'number') {
-        const parsed = parseId(rawPayer);
-        if (parsed === null) {
-          res.status(400).json({ error: 'Invalid payer ID: must be a positive integer' });
-          return;
-        }
-        payerUserId = parsed;
-      } else if (typeof rawPayer === 'string') {
-        const trimmed = rawPayer.trim();
-        if (!trimmed) {
-          res.status(400).json({ error: 'Payer name cannot be empty' });
-          return;
-        }
-        const user = selectUserByName.get(trimmed) as { id: number; name: string } | undefined;
-        if (!user) {
-          res.status(400).json({ error: 'Payer must be a member of the group' });
-          return;
-        }
-        payerUserId = user.id;
-      } else if (typeof rawPayer === 'object' && !Array.isArray(rawPayer)) {
-        const obj = rawPayer as Record<string, unknown>;
-        if (obj.id !== undefined && obj.id !== null) {
-          const parsed = parseId(obj.id);
-          if (parsed === null) {
-            res.status(400).json({ error: 'Invalid payer ID: must be a positive integer' });
-            return;
-          }
-          payerUserId = parsed;
-        } else if (obj.name !== undefined && obj.name !== null) {
-          if (typeof obj.name !== 'string') {
-            res.status(400).json({ error: 'Payer name must be a string' });
-            return;
-          }
-          const trimmed = obj.name.trim();
-          if (!trimmed) {
-            res.status(400).json({ error: 'Payer name cannot be empty' });
-            return;
-          }
-          const user = selectUserByName.get(trimmed) as { id: number; name: string } | undefined;
-          if (!user) {
-            res.status(400).json({ error: 'Payer must be a member of the group' });
-            return;
-          }
-          payerUserId = user.id;
-        } else {
-          res.status(400).json({ error: 'Invalid payer format' });
-          return;
-        }
-      } else {
-        res.status(400).json({ error: 'Invalid payer format' });
-        return;
-      }
-
-      // Check that payer is a member of this group
-      const isMember = checkMembershipStmt.get(groupId, payerUserId);
-      if (!isMember) {
-        res.status(400).json({ error: 'Payer must be a member of the group' });
-        return;
-      }
+      const payerUserId = resolveGroupParticipant(body, 'Payer', groupId, EXPENSE_PAYER_ALIASES);
 
       const memberRows = selectGroupMemberIds.all(groupId) as { user_id: number }[];
       const memberIds = memberRows.map((r) => r.user_id);
@@ -639,6 +702,136 @@ export function createGroupRouter(db: Database.Database): Router {
     }
   });
 
+  // POST /groups/:id/settle - Record a debt repayment between two group members
+  router.post('/:id/settle', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const rawId = req.params.id;
+      const groupId = parseId(rawId);
+      if (groupId === null) {
+        res.status(400).json({ error: 'Invalid group ID: must be a positive integer' });
+        return;
+      }
+
+      const group = selectGroupById.get(groupId);
+      if (!group) {
+        res.status(404).json({ error: 'Group not found' });
+        return;
+      }
+
+      const body = req.body ?? {};
+      const amount = parseAmount(body.amount);
+      const description = parseDescription(body.description);
+      const date = parseDate(body.date);
+
+      const fromUserId = resolveGroupParticipant(body, 'Payer', groupId, SETTLE_FROM_ALIASES);
+      const toUserId = resolveGroupParticipant(body, 'Payee', groupId, SETTLE_TO_ALIASES);
+
+      // Member cannot settle with themselves
+      if (fromUserId === toUserId) {
+        res.status(400).json({ error: 'Cannot settle with self' });
+        return;
+      }
+
+      let settlementId: number;
+      if (date !== undefined) {
+        const info = insertSettlementWithDateStmt.run(groupId, fromUserId, toUserId, amount, description, date);
+        settlementId = Number(info.lastInsertRowid);
+      } else {
+        const info = insertSettlementStmt.run(groupId, fromUserId, toUserId, amount, description);
+        settlementId = Number(info.lastInsertRowid);
+      }
+
+      const created = selectSettlementById.get(settlementId) as {
+        id: number;
+        group_id: number;
+        from_user_id: number;
+        to_user_id: number;
+        amount: number;
+        description: string;
+        date: string;
+        created_at: string;
+        from_name: string;
+        to_name: string;
+      };
+
+      const result: Settlement = {
+        id: created.id,
+        group_id: created.group_id,
+        from: created.from_user_id,
+        to: created.to_user_id,
+        from_user_id: created.from_user_id,
+        to_user_id: created.to_user_id,
+        from_name: created.from_name,
+        to_name: created.to_name,
+        amount: created.amount,
+        description: created.description,
+        date: created.date,
+        created_at: created.created_at,
+      };
+
+      res.status(201).json(result);
+    } catch (err) {
+      if (err instanceof ValidationError) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      next(err);
+    }
+  });
+
+  // Handler for listing settlements
+  const handleListSettlements = (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const rawId = req.params.id;
+      const groupId = parseId(rawId);
+      if (groupId === null) {
+        res.status(400).json({ error: 'Invalid group ID: must be a positive integer' });
+        return;
+      }
+
+      const group = selectGroupById.get(groupId);
+      if (!group) {
+        res.status(404).json({ error: 'Group not found' });
+        return;
+      }
+
+      const rows = selectSettlementsByGroupId.all(groupId) as {
+        id: number;
+        group_id: number;
+        from_user_id: number;
+        to_user_id: number;
+        amount: number;
+        description: string;
+        date: string;
+        created_at: string;
+        from_name: string;
+        to_name: string;
+      }[];
+
+      const settlements: Settlement[] = rows.map((r) => ({
+        id: r.id,
+        group_id: r.group_id,
+        from: r.from_user_id,
+        to: r.to_user_id,
+        from_user_id: r.from_user_id,
+        to_user_id: r.to_user_id,
+        from_name: r.from_name,
+        to_name: r.to_name,
+        amount: r.amount,
+        description: r.description,
+        date: r.date,
+        created_at: r.created_at,
+      }));
+
+      res.status(200).json(settlements);
+    } catch (err) {
+      next(err);
+    }
+  };
+
+  // GET /groups/:id/settlements - List recorded settlements for a group
+  router.get('/:id/settlements', handleListSettlements);
+
   // GET /groups/:id/balances - Get group balance summary
   router.get('/:id/balances', (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -657,8 +850,33 @@ export function createGroupRouter(db: Database.Database): Router {
 
       const members = selectGroupMembers.all(groupId) as Member[];
       const fullExpenses = getGroupExpensesWithSplits(groupId);
+      const settlements = selectSettlementsByGroupId.all(groupId) as {
+        id: number;
+        group_id: number;
+        from_user_id: number;
+        to_user_id: number;
+        amount: number;
+        description: string;
+        date: string;
+        created_at: string;
+        from_name: string;
+        to_name: string;
+      }[];
 
-      const summary = calculateBalances(fullExpenses, { members });
+      const settlementInputs: SettlementInput[] = settlements.map((s) => ({
+        id: s.id,
+        group_id: s.group_id,
+        from: s.from_user_id,
+        to: s.to_user_id,
+        from_user_id: s.from_user_id,
+        to_user_id: s.to_user_id,
+        amount: s.amount,
+      }));
+
+      const summary = calculateBalances(fullExpenses, {
+        members,
+        settlements: settlementInputs,
+      });
       res.status(200).json(summary);
     } catch (err) {
       if (err instanceof BalanceEngineError) {

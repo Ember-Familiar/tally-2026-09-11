@@ -6,25 +6,28 @@ import { runMigrations } from "../src/migrations";
 
 
 describe("Migrations & Data Model", () => {
-  it("applies cleanly from empty and creates all 5 tables plus schema_migrations", () => {
+  it("applies cleanly from empty and creates all 6 tables plus schema_migrations", () => {
     const db = createDatabase(":memory:", { autoMigrate: false });
 
     const applied = runMigrations(db);
     expect(applied).toContain("001_initial_schema.sql");
-    expect(applied.length).toBe(1);
+    expect(applied).toContain("002_settlements.sql");
+    expect(applied.length).toBe(2);
 
     const migrations = db.prepare("SELECT name, applied_at FROM schema_migrations;").all() as {
       name: string;
       applied_at: string;
     }[];
-    expect(migrations.length).toBe(1);
+    expect(migrations.length).toBe(2);
     expect(migrations[0].name).toBe("001_initial_schema.sql");
+    expect(migrations[1].name).toBe("002_settlements.sql");
     expect(migrations[0].applied_at).toBeDefined();
+    expect(migrations[1].applied_at).toBeDefined();
 
     const tables = (
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'groups', 'group_members', 'expenses', 'expense_splits') ORDER BY name;"
+          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'groups', 'group_members', 'expenses', 'expense_splits', 'settlements') ORDER BY name;"
         )
         .all() as { name: string }[]
     ).map((r) => r.name);
@@ -34,6 +37,7 @@ describe("Migrations & Data Model", () => {
       "expenses",
       "group_members",
       "groups",
+      "settlements",
       "users",
     ]);
 
@@ -46,6 +50,15 @@ describe("Migrations & Data Model", () => {
     );
     expect(indexes.length).toBe(1);
 
+    const settlementIndexes = (
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_settlements_group_id_date_id';"
+        )
+        .all() as { name: string }[]
+    );
+    expect(settlementIndexes.length).toBe(1);
+
     db.close();
   });
 
@@ -53,7 +66,7 @@ describe("Migrations & Data Model", () => {
     const db = createDatabase(":memory:", { autoMigrate: false });
 
     const firstRun = runMigrations(db);
-    expect(firstRun.length).toBe(1);
+    expect(firstRun.length).toBe(2);
 
     const secondRun = runMigrations(db);
     expect(secondRun.length).toBe(0);
@@ -67,12 +80,12 @@ describe("Migrations & Data Model", () => {
     const tables = (
       db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'groups', 'group_members', 'expenses', 'expense_splits') ORDER BY name;"
+          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'groups', 'group_members', 'expenses', 'expense_splits', 'settlements') ORDER BY name;"
         )
         .all() as { name: string }[]
     ).map((r) => r.name);
 
-    expect(tables.length).toBe(5);
+    expect(tables.length).toBe(6);
     db.close();
   });
 
@@ -448,6 +461,85 @@ describe("Migrations & Data Model", () => {
 
       const usersCount = (db.prepare("SELECT count(*) as count FROM users;").get() as { count: number }).count;
       expect(usersCount).toBe(2);
+
+      db.close();
+    });
+
+    it("accepts valid settlement rows and enforces settlements table constraints", () => {
+      const db = createDatabase(":memory:");
+
+      db.prepare("INSERT INTO users (name) VALUES (?);").run("Alice");
+      db.prepare("INSERT INTO users (name) VALUES (?);").run("Bob");
+      db.prepare("INSERT INTO groups (name) VALUES (?);").run("Trip");
+
+      const stmt = db.prepare(
+        "INSERT INTO settlements (group_id, from_user_id, to_user_id, amount, description, date) VALUES (?, ?, ?, ?, ?, ?);"
+      );
+      const res = stmt.run(1, 2, 1, 2500, "Repaying dinner", "2026-09-05 20:00:00");
+      expect(Number(res.lastInsertRowid)).toBe(1);
+
+      const row = db.prepare("SELECT * FROM settlements WHERE id = 1;").get() as {
+        id: number;
+        group_id: number;
+        from_user_id: number;
+        to_user_id: number;
+        amount: number;
+        description: string;
+        date: string;
+        created_at: string;
+      };
+      expect(row.group_id).toBe(1);
+      expect(row.from_user_id).toBe(2);
+      expect(row.to_user_id).toBe(1);
+      expect(row.amount).toBe(2500);
+      expect(row.description).toBe("Repaying dinner");
+      expect(row.date).toBe("2026-09-05 20:00:00");
+      expect(row.created_at).toBeDefined();
+
+      // Rejects self-settlement (CHECK constraint)
+      expect(() => {
+        stmt.run(1, 1, 1, 1000, "Self settle", "2026-09-05 20:00:00");
+      }).toThrow(/CHECK constraint failed/);
+
+      // Rejects invalid amounts
+      expect(() => {
+        stmt.run(1, 2, 1, 0, "Zero amount", "2026-09-05 20:00:00");
+      }).toThrow(/CHECK constraint failed/);
+      expect(() => {
+        stmt.run(1, 2, 1, -500, "Negative amount", "2026-09-05 20:00:00");
+      }).toThrow(/CHECK constraint failed/);
+      expect(() => {
+        stmt.run(1, 2, 1, 12.5, "Float amount", "2026-09-05 20:00:00");
+      }).toThrow(/CHECK constraint failed/);
+
+      // Rejects invalid date format
+      expect(() => {
+        stmt.run(1, 2, 1, 1000, "Bad date", "invalid-date");
+      }).toThrow(/CHECK constraint failed/);
+
+      // Rejects foreign key violations
+      expect(() => {
+        stmt.run(999, 2, 1, 1000, "Bad group", "2026-09-05 20:00:00");
+      }).toThrow(/FOREIGN KEY constraint failed/);
+      expect(() => {
+        stmt.run(1, 999, 1, 1000, "Bad from", "2026-09-05 20:00:00");
+      }).toThrow(/FOREIGN KEY constraint failed/);
+      expect(() => {
+        stmt.run(1, 2, 999, 1000, "Bad to", "2026-09-05 20:00:00");
+      }).toThrow(/FOREIGN KEY constraint failed/);
+
+      // Enforces ON DELETE RESTRICT on settlements from_user_id and to_user_id
+      expect(() => {
+        db.prepare("DELETE FROM users WHERE id = 1;").run();
+      }).toThrow(/FOREIGN KEY constraint failed/);
+      expect(() => {
+        db.prepare("DELETE FROM users WHERE id = 2;").run();
+      }).toThrow(/FOREIGN KEY constraint failed/);
+
+      // Enforces ON DELETE CASCADE on settlements when group is deleted
+      db.prepare("DELETE FROM groups WHERE id = 1;").run();
+      const settlementCount = (db.prepare("SELECT count(*) as count FROM settlements WHERE group_id = 1;").get() as { count: number }).count;
+      expect(settlementCount).toBe(0);
 
       db.close();
     });
