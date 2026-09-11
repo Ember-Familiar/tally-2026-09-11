@@ -244,3 +244,114 @@ If the group has no expenses, returns `200 OK` with an empty array `[]`.
 **Error Responses (`400 Bad Request` / `404 Not Found`)**:
 - Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
 - Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
+## Balance Engine (`src/balances.ts`)
+
+Pure, unit-tested balance calculation engine and deterministic debt simplification using strict integer-cent arithmetic.
+
+### Core Principles & Invariants
+
+1. **Integer-Cent Arithmetic & Overflow Protection**:
+   - Every currency amount (`amount`, `paid`, `owed`, `net_balance`, `balance`, transfer amounts, and `total_spend`) is strictly represented as a safe integer in cents (`Number.isSafeInteger(amount)`).
+   - Floating-point currency values (e.g. `10.5` or `33.33`) are forbidden and rejected with `BalanceEngineError` (`INVALID_AMOUNT`).
+   - All public accumulators (`paid`, `owed`, `net_balance`, `total_spend`, pairwise debt amounts, settlement amounts) use checked addition and subtraction (`checkedAdd`, `checkedSub`) and throw `BalanceEngineError` with error code `INTEGER_OVERFLOW` before any unsafe numeric output can be returned.
+   - Invariant-only totals (e.g. `splitSum` conservation and `totalNet` zero-sum verification in `simplifyDebts`) accumulate using arbitrary-precision `BigInt` to prevent floating-point precision loss or false conservation failures at `Number.MAX_SAFE_INTEGER`.
+   - Calculations use exact integer additions, subtractions, and integer remainder distributions—zero floating-point arithmetic is used.
+
+2. **Zero-Sum Conservation**:
+   - Across any valid set of expenses (and optional settlements), net balances conserve exactly to zero:
+     $$\sum_{u} \text{net\_balance}_u = 0$$
+   - In odd divisions (e.g. 100 cents split across 3 members), remainder cents are allocated deterministically to the first members ordered by `user_id ASC`, preserving exact conservation with no manufactured or lost cents.
+
+3. **Expense Splits Integrity & Cascade Handling**:
+   - For every expense with splits, the sum of split amounts must strictly equal the expense amount (`sum(splits) === expense.amount`).
+   - If an expense has torn splits (such as when `sum(splits) < expense.amount` caused by manual/direct SQLite cascade deletions where `expense_splits.user_id ON DELETE CASCADE` drops a participant row, or malformed splits where `sum(splits) !== expense.amount`), the engine rejects the input by throwing a typed `BalanceEngineError` with error code `INCONSISTENT_SPLITS`.
+   - The balance engine strictly refuses to silently manufacture unbacked credits or silently drop participant debts, ensuring no cents can ever be created or lost out of thin air.
+   - Duplicate participant splits within the same expense are strictly rejected across all entry points (`calculateBalances`, `calculateUserBalances`, `calculatePairwiseDebts`) with `BalanceEngineError` (`DUPLICATE_SPLIT_USER`).
+
+4. **Deterministic Debt Simplification**:
+   - Net balances are partitioned into debtors (net balance < 0) and creditors (net balance > 0).
+   - Array inputs are strictly validated for user uniqueness, rejecting duplicate user IDs with `BalanceEngineError` (`DUPLICATE_USER`).
+   - Debtors and creditors are sorted with primary key `amount DESC` (greedily settling largest amounts first to minimize transaction count) and secondary tiebreak key `userId ASC` (ensuring 100% deterministic, reproducible outputs).
+   - Every simplified transfer:
+     - Moves a strictly positive integer cent amount (`amount > 0`).
+     - Preserves the exact input net position for every user: $(\sum \text{received}) - (\sum \text{sent}) = \text{net\_balance}$.
+     - Defensively asserts distinct endpoints (`from !== to`), preventing self-transfers.
+     - Yields an empty array `[]` for empty or already-settled inputs.
+
+### Exported Functions
+
+```typescript
+// Detailed user balance records (paid, owed, net_balance, balance) sorted by user_id ASC
+function calculateUserBalances(expenses?: ExpenseInput[], options?: BalanceOptions): UserBalance[];
+
+// Map of userId -> net_balance in integer cents (positive = creditor, negative = debtor)
+function calculateNetBalances(expenses?: ExpenseInput[], options?: BalanceOptions): Record<number, number>;
+
+// Deterministic greedy debt simplification minimizing transaction count
+function simplifyDebts(netBalances?: UserBalance[] | Record<number | string, number> | Map<number | string, number> | null): Transfer[];
+
+// Direct bilateral pairwise debts netted between user pairs
+function calculatePairwiseDebts(expenses?: ExpenseInput[], options?: BalanceOptions): PairwiseDebt[];
+
+// High-level engine combining balances, net_balances, simplified settlements, pairwise, and total_spend
+function calculateBalances(expenses?: ExpenseInput[], options?: BalanceOptions): GroupBalanceSummary;
+
+// Checked integer addition and subtraction validating safe-integer arguments (INVALID_AMOUNT) and throwing INTEGER_OVERFLOW if safe-integer domain is breached
+function checkedAdd(a: number, b: number, context?: string): number;
+function checkedSub(a: number, b: number, context?: string): number;
+```
+
+### Exported Types
+
+```typescript
+export interface UserBalance {
+  user_id: number;
+  userId: number; // alias
+  name: string | null;
+  paid: number; // integer cents
+  owed: number; // integer cents
+  net_balance: number; // integer cents (paid - owed)
+  balance: number; // alias for net_balance
+}
+
+export interface Transfer {
+  from: number;
+  to: number;
+  from_user_id: number;
+  to_user_id: number;
+  from_name?: string;
+  to_name?: string;
+  amount: number; // positive integer cents
+}
+
+export type PairwiseDebt = Transfer;
+
+export interface GroupBalanceSummary {
+  balances: UserBalance[];
+  net_balances: Record<number, number>;
+  settlements: Transfer[];
+  pairwise: Transfer[];
+  total_spend: number; // integer cents
+}
+
+export interface BalanceOptions {
+  members?: Array<number | { id?: number; user_id?: number; userId?: number; name?: string | null }>;
+  splits?: Array<{ expense_id?: number; user_id?: number; userId?: number; amount: number; user_name?: string | null }>;
+  settlements?: Array<{ from?: number; from_user_id?: number; to?: number; to_user_id?: number; amount: number }>;
+}
+```
+
+### Consumption in Task 7 (`GET /groups/:id/balances`)
+
+Task 7 can compute balances directly by fetching group expenses (which already include splits from Task 5) and group members, and invoking:
+
+```typescript
+import { calculateBalances } from 'tally'; // or '../balances'
+
+const summary = calculateBalances(groupExpenses, { members: groupMembers });
+// summary.balances -> array of UserBalance
+// summary.net_balances -> { [userId]: netCents }
+// summary.settlements -> simplified transfers
+// summary.pairwise -> bilateral pairwise debts
+// summary.total_spend -> total expenses amount in cents
+```
