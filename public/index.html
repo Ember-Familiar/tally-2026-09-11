@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tally - Expense Splitter</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="header-brand">
+        <span class="logo-icon">📊</span>
+        <h1>Tally</h1>
+      </div>
+      <p class="tagline">Simple, fair expense splitting for groups</p>
+    </header>
+
+    <main class="main-content">
+      <!-- Create Group Section -->
+      <section class="card" id="create-group-section">
+        <h2 class="card-title">Create a New Group</h2>
+        <p class="card-subtitle">Set up a group and add members to start tracking shared expenses.</p>
+
+        <form id="create-group-form" class="form" novalidate>
+          <div class="form-group">
+            <label for="group-name" class="form-label">Group Name <span class="required">*</span></label>
+            <input
+              type="text"
+              id="group-name"
+              name="name"
+              class="form-input"
+              placeholder="e.g. Ski Trip 2026, Apartment Roommates"
+              required
+              maxlength="100"
+            >
+          </div>
+
+          <div class="form-group">
+            <label for="group-members" class="form-label">Initial Members <span class="required">*</span></label>
+            <input
+              type="text"
+              id="group-members"
+              name="members"
+              class="form-input"
+              placeholder="e.g. Alice, Bob, Charlie"
+              required
+            >
+            <span class="form-hint">Separate member names with commas (e.g. "Alice, Bob, Charlie").</span>
+          </div>
+
+          <div id="form-feedback" class="feedback-message hidden" role="alert"></div>
+
+          <div class="form-actions">
+            <button type="submit" id="create-group-btn" class="btn btn-primary">
+              <span class="btn-text">Create Group</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Groups List Section -->
+      <section class="card" id="groups-section">
+        <div class="card-header-actions">
+          <div>
+            <h2 class="card-title">Your Groups</h2>
+            <p class="card-subtitle">View and manage all active expense groups.</p>
+          </div>
+          <button id="refresh-groups-btn" class="btn btn-secondary btn-sm" title="Refresh groups list">
+            🔄 Refresh
+          </button>
+        </div>
+
+        <div id="groups-status-container"></div>
+        <div id="groups-list" class="groups-grid" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>Tally Expense Splitter &copy; 2026</p>
+    </footer>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

@@ -26,6 +26,10 @@ This starts the server on port 3000 by default (`node dist/server.js`), using th
 - `PORT`: Port number for the HTTP server (default: `3000`). Must be a valid port integer between 1 and 65535.
 - `DB_PATH`: Path to the SQLite database file (default: `tally.db` for the server and migration CLI; `:memory:` for the test suite). Set `DB_PATH=:memory:` if you want an ephemeral in-memory database instance.
 
+## Web UI
+
+Tally includes a browser interface served at `/` when navigating with a web browser (or requesting `Accept: text/html`). Static assets (`index.html`, `style.css`, `app.js`) reside in the root `public/` directory and are served by the Express backend.
+
 ## API Endpoints
 
 ### Health Checks
