@@ -97,6 +97,37 @@ export interface MemberInput {
   name?: string | null;
 }
 
+export interface CalculatedSplit {
+  userId: number;
+  amount: number;
+  name?: string | null;
+}
+
+export interface RatioSplitItem {
+  user_id?: number;
+  userId?: number;
+  ratio?: number;
+  shares?: number;
+  weight?: number;
+  name?: string | null;
+}
+
+export interface PercentageSplitItem {
+  user_id?: number;
+  userId?: number;
+  percentage?: number;
+  percent?: number;
+  pct?: number;
+  name?: string | null;
+}
+
+export interface ExactSplitItem {
+  user_id?: number;
+  userId?: number;
+  amount: number;
+  name?: string | null;
+}
+
 export interface ExpenseSplitInput {
   id?: number;
   expense_id?: number;
@@ -104,7 +135,13 @@ export interface ExpenseSplitInput {
   userId?: number;
   user_name?: string | null;
   name?: string | null;
-  amount: number;
+  amount?: number;
+  ratio?: number;
+  shares?: number;
+  weight?: number;
+  percentage?: number;
+  percent?: number;
+  pct?: number;
   created_at?: string;
 }
 
@@ -117,7 +154,10 @@ export interface ExpenseInput {
   description?: string;
   date?: string;
   created_at?: string;
-  splits?: ExpenseSplitInput[];
+  splits?: ExpenseSplitInput[] | Record<string | number, number>;
+  shares?: Record<string | number, number> | RatioSplitItem[];
+  ratios?: Record<string | number, number> | RatioSplitItem[];
+  percentages?: Record<string | number, number> | PercentageSplitItem[];
 }
 
 export interface SettlementInput {
@@ -281,6 +321,464 @@ function distributeEqualSplits(totalAmount: number, memberUserIds: number[]): Ex
 }
 
 /**
+ * Validates and calculates custom exact split amounts in integer cents.
+ * Asserts sum(splits) === totalAmount.
+ */
+export function calculateExactSplits(
+  totalAmount: number,
+  splits: ExactSplitItem[]
+): CalculatedSplit[] {
+  const validTotal = validateExpenseAmount(totalAmount);
+  if (!Array.isArray(splits) || splits.length === 0) {
+    throw new BalanceEngineError('Splits list cannot be empty', 'INVALID_INPUT');
+  }
+
+  const seenUsers = new Set<number>();
+  let sum = 0;
+  const results: CalculatedSplit[] = [];
+
+  for (const s of splits) {
+    if (!s || typeof s !== 'object') {
+      throw new BalanceEngineError('Invalid split item: must be an object', 'INVALID_INPUT');
+    }
+    const rawId = s.user_id ?? s.userId;
+    const userId = normalizeUserId(rawId);
+    if (seenUsers.has(userId)) {
+      throw new BalanceEngineError(`Duplicate split for user ${userId}`, 'DUPLICATE_SPLIT_USER');
+    }
+    seenUsers.add(userId);
+
+    const amt = s.amount;
+    if (typeof amt !== 'number' || !Number.isSafeInteger(amt) || amt <= 0) {
+      throw new BalanceEngineError('Split amount must be a positive integer in cents', 'INVALID_AMOUNT');
+    }
+
+    sum = checkedAdd(sum, amt, 'exact split sum');
+    results.push({ userId, amount: amt, name: s.name ?? null });
+  }
+
+  if (sum !== validTotal) {
+    throw new BalanceEngineError(
+      `Split amounts sum (${sum}) does not equal total amount (${validTotal})`,
+      'INCONSISTENT_SPLITS'
+    );
+  }
+
+  results.sort((a, b) => a.userId - b.userId);
+  return results;
+}
+
+/**
+ * Distributes totalAmount across members according to ratios/shares using largest remainder method.
+ * Remainder cents are allocated to members with largest fractional remainder; ties broken by userId ASC.
+ */
+export function calculateRatioSplits(
+  totalAmount: number,
+  ratios: RatioSplitItem[]
+): CalculatedSplit[] {
+  const validTotal = validateExpenseAmount(totalAmount);
+  if (!Array.isArray(ratios) || ratios.length === 0) {
+    throw new BalanceEngineError('Splits list cannot be empty', 'INVALID_INPUT');
+  }
+
+  const seenUsers = new Set<number>();
+  const parsedItems: Array<{ userId: number; weight: number; name?: string | null }> = [];
+
+  for (const item of ratios) {
+    if (!item || typeof item !== 'object') {
+      throw new BalanceEngineError('Invalid ratio split item: must be an object', 'INVALID_INPUT');
+    }
+    const rawId = item.user_id ?? item.userId;
+    const userId = normalizeUserId(rawId);
+    if (seenUsers.has(userId)) {
+      throw new BalanceEngineError(`Duplicate split for user ${userId}`, 'DUPLICATE_SPLIT_USER');
+    }
+    seenUsers.add(userId);
+
+    const presentWeightKeys = (['ratio', 'shares', 'weight'] as const).filter(
+      (k) => item[k] !== undefined
+    );
+    if (presentWeightKeys.length > 1) {
+      throw new BalanceEngineError(
+        'Ambiguous split ratio item: multiple weight properties provided',
+        'INVALID_INPUT'
+      );
+    }
+    const rawWeight = presentWeightKeys.length === 1 ? item[presentWeightKeys[0]] : undefined;
+    if (typeof rawWeight !== 'number' || !Number.isFinite(rawWeight) || rawWeight <= 0) {
+      throw new BalanceEngineError('Split ratio must be a positive number', 'INVALID_INPUT');
+    }
+    parsedItems.push({ userId, weight: rawWeight, name: item.name ?? null });
+  }
+
+  let maxDecimals = 0;
+  for (const item of parsedItems) {
+    const s = item.weight.toString();
+    const dotIdx = s.indexOf('.');
+    if (dotIdx !== -1) {
+      const decLen = s.length - dotIdx - 1;
+      if (decLen > maxDecimals) maxDecimals = decLen;
+    }
+  }
+  if (maxDecimals > 6) maxDecimals = 6;
+  const scale = 10 ** maxDecimals;
+
+  let totalWeight = 0n;
+  const bigItems = parsedItems.map((p) => {
+    const scaled = p.weight * scale;
+    if (!Number.isFinite(scaled) || !Number.isFinite(Math.round(scaled))) {
+      throw new BalanceEngineError('Split ratio exceeds maximum allowable value', 'INVALID_INPUT');
+    }
+    const w = BigInt(Math.round(scaled));
+    if (w <= 0n) {
+      throw new BalanceEngineError('Split ratio must be a positive number', 'INVALID_INPUT');
+    }
+    totalWeight += w;
+    return { userId: p.userId, weight: w, name: p.name };
+  });
+
+  if (totalWeight <= 0n) {
+    throw new BalanceEngineError('Total ratio must be positive', 'INVALID_INPUT');
+  }
+
+  const bigTotal = BigInt(validTotal);
+  let baseSum = 0;
+  const allocations = bigItems.map((item, index) => {
+    const numerator = item.weight * bigTotal;
+    const base = Number(numerator / totalWeight);
+    const rem = numerator % totalWeight;
+    baseSum = checkedAdd(baseSum, base, 'ratio base sum');
+    return {
+      userId: item.userId,
+      base,
+      rem,
+      index,
+      name: item.name,
+    };
+  });
+
+  const remainderCents = validTotal - baseSum;
+  allocations.sort((a, b) => {
+    if (b.rem !== a.rem) {
+      return b.rem > a.rem ? 1 : -1;
+    }
+    return a.userId - b.userId;
+  });
+
+  for (let i = 0; i < remainderCents; i++) {
+    allocations[i].base += 1;
+  }
+
+  const results: CalculatedSplit[] = allocations.map((a) => ({
+    userId: a.userId,
+    amount: a.base,
+    name: a.name ?? null,
+  }));
+
+  results.sort((a, b) => a.userId - b.userId);
+  return results;
+}
+
+/**
+ * Distributes totalAmount across members according to percentages using largest remainder method.
+ * Percentages must sum to 100.
+ * Remainder cents are allocated to members with largest fractional remainder; ties broken by userId ASC.
+ */
+export function calculatePercentageSplits(
+  totalAmount: number,
+  percentages: PercentageSplitItem[]
+): CalculatedSplit[] {
+  const validTotal = validateExpenseAmount(totalAmount);
+  if (!Array.isArray(percentages) || percentages.length === 0) {
+    throw new BalanceEngineError('Splits list cannot be empty', 'INVALID_INPUT');
+  }
+
+  const seenUsers = new Set<number>();
+  const parsedItems: Array<{ userId: number; percentage: number; name?: string | null }> = [];
+  let rawSum = 0;
+
+  for (const item of percentages) {
+    if (!item || typeof item !== 'object') {
+      throw new BalanceEngineError('Invalid percentage split item: must be an object', 'INVALID_INPUT');
+    }
+    const rawId = item.user_id ?? item.userId;
+    const userId = normalizeUserId(rawId);
+    if (seenUsers.has(userId)) {
+      throw new BalanceEngineError(`Duplicate split for user ${userId}`, 'DUPLICATE_SPLIT_USER');
+    }
+    seenUsers.add(userId);
+
+    const presentPctKeys = (['percentage', 'percent', 'pct'] as const).filter(
+      (k) => item[k] !== undefined
+    );
+    if (presentPctKeys.length > 1) {
+      throw new BalanceEngineError(
+        'Ambiguous split percentage item: multiple percentage properties provided',
+        'INVALID_INPUT'
+      );
+    }
+    const rawPct = presentPctKeys.length === 1 ? item[presentPctKeys[0]] : undefined;
+    if (typeof rawPct !== 'number' || !Number.isFinite(rawPct) || rawPct <= 0) {
+      throw new BalanceEngineError('Split percentage must be positive', 'INVALID_INPUT');
+    }
+    rawSum += rawPct;
+    parsedItems.push({ userId, percentage: rawPct, name: item.name ?? null });
+  }
+
+  if (Math.abs(rawSum - 100) > 1e-5) {
+    throw new BalanceEngineError('Split percentages must sum to 100', 'INVALID_INPUT');
+  }
+
+  let maxDecimals = 0;
+  for (const item of parsedItems) {
+    const s = item.percentage.toString();
+    const dotIdx = s.indexOf('.');
+    if (dotIdx !== -1) {
+      const decLen = s.length - dotIdx - 1;
+      if (decLen > maxDecimals) maxDecimals = decLen;
+    }
+  }
+  if (maxDecimals > 6) maxDecimals = 6;
+  const scale = 10 ** maxDecimals;
+
+  let totalWeight = 0n;
+  const bigItems = parsedItems.map((p) => {
+    const scaled = p.percentage * scale;
+    if (!Number.isFinite(scaled) || !Number.isFinite(Math.round(scaled))) {
+      throw new BalanceEngineError('Split percentage exceeds maximum allowable value', 'INVALID_INPUT');
+    }
+    const w = BigInt(Math.round(scaled));
+    if (w <= 0n) {
+      throw new BalanceEngineError('Split percentage must be positive', 'INVALID_INPUT');
+    }
+    totalWeight += w;
+    return { userId: p.userId, weight: w, name: p.name };
+  });
+
+  const bigTotal = BigInt(validTotal);
+  let baseSum = 0;
+  const allocations = bigItems.map((item, index) => {
+    const numerator = item.weight * bigTotal;
+    const base = Number(numerator / totalWeight);
+    const rem = numerator % totalWeight;
+    baseSum = checkedAdd(baseSum, base, 'percentage base sum');
+    return {
+      userId: item.userId,
+      base,
+      rem,
+      index,
+      name: item.name,
+    };
+  });
+
+  const remainderCents = validTotal - baseSum;
+  allocations.sort((a, b) => {
+    if (b.rem !== a.rem) {
+      return b.rem > a.rem ? 1 : -1;
+    }
+    return a.userId - b.userId;
+  });
+
+  for (let i = 0; i < remainderCents; i++) {
+    allocations[i].base += 1;
+  }
+
+  const results: CalculatedSplit[] = allocations.map((a) => ({
+    userId: a.userId,
+    amount: a.base,
+    name: a.name ?? null,
+  }));
+
+  results.sort((a, b) => a.userId - b.userId);
+  return results;
+}
+
+/**
+ * Resolves splits for an engine expense across splits array, shares/ratios, percentages, or member list.
+ */
+function resolveEngineExpenseSplits(
+  exp: ExpenseInput,
+  amount: number,
+  memberIdsList: number[],
+  separateSplitsByExpenseId: Map<number, ExpenseSplitInput[]>,
+  memberNameToIdMap?: Map<string, number>
+): ExpenseSplitInput[] {
+  function resolveId(raw: unknown): number {
+    if (typeof raw === 'string' && memberNameToIdMap) {
+      const trimmed = raw.trim().toLowerCase();
+      const matched = memberNameToIdMap.get(trimmed);
+      if (matched !== undefined) {
+        return matched;
+      }
+    }
+    return normalizeUserId(raw);
+  }
+
+  if (Array.isArray(exp.splits) && exp.splits.length > 0) {
+    for (const s of exp.splits) {
+      if (!s || typeof s !== 'object') {
+        return exp.splits;
+      }
+    }
+
+    let hasRatio = false;
+    let hasPct = false;
+    let hasAmount = false;
+    for (const s of exp.splits) {
+      const anyS = s as Record<string, unknown>;
+      if (anyS.ratio !== undefined || anyS.shares !== undefined || anyS.weight !== undefined) {
+        hasRatio = true;
+      }
+      if (anyS.percentage !== undefined || anyS.percent !== undefined || anyS.pct !== undefined) {
+        hasPct = true;
+      }
+      if (anyS.amount !== undefined) {
+        hasAmount = true;
+      }
+    }
+
+    if (hasRatio && (hasPct || hasAmount)) {
+      throw new BalanceEngineError(
+        'Mixed split specification: cannot mix amounts, ratios, and percentages',
+        'INVALID_INPUT'
+      );
+    }
+    if (hasPct && hasAmount) {
+      throw new BalanceEngineError(
+        'Mixed split specification: cannot mix amounts, ratios, and percentages',
+        'INVALID_INPUT'
+      );
+    }
+
+    if (hasRatio) {
+      const ratioItems: RatioSplitItem[] = exp.splits.map((s) => {
+        const anyS = (s && typeof s === 'object' ? s : {}) as Record<string, unknown>;
+        return {
+          userId: resolveId(anyS.user_id ?? anyS.userId ?? anyS.id ?? anyS.name),
+          ratio: (anyS.ratio ?? anyS.shares ?? anyS.weight) as number,
+          name: (anyS.name ?? anyS.user_name) as string | null,
+        };
+      });
+      const calculated = calculateRatioSplits(amount, ratioItems);
+      return calculated.map((c) => ({
+        userId: c.userId,
+        user_id: c.userId,
+        amount: c.amount,
+        name: c.name,
+      }));
+    }
+    if (hasPct) {
+      const pctItems: PercentageSplitItem[] = exp.splits.map((s) => {
+        const anyS = (s && typeof s === 'object' ? s : {}) as Record<string, unknown>;
+        return {
+          userId: resolveId(anyS.user_id ?? anyS.userId ?? anyS.id ?? anyS.name),
+          percentage: (anyS.percentage ?? anyS.percent ?? anyS.pct) as number,
+          name: (anyS.name ?? anyS.user_name) as string | null,
+        };
+      });
+      const calculated = calculatePercentageSplits(amount, pctItems);
+      return calculated.map((c) => ({
+        userId: c.userId,
+        user_id: c.userId,
+        amount: c.amount,
+        name: c.name,
+      }));
+    }
+    if (hasAmount) {
+      return exp.splits;
+    }
+    return distributeEqualSplits(
+      amount,
+      exp.splits.map((s) =>
+        resolveId(
+          s.user_id ?? s.userId ?? (s as Record<string, unknown>).id ?? (s as Record<string, unknown>).name
+        )
+      )
+    );
+  }
+
+  if (exp.splits && typeof exp.splits === 'object' && !Array.isArray(exp.splits)) {
+    const exactItems: ExactSplitItem[] = Object.entries(exp.splits).map(([key, val]) => ({
+      userId: resolveId(key),
+      amount: val as number,
+    }));
+    const calculated = calculateExactSplits(amount, exactItems);
+    return calculated.map((c) => ({
+      userId: c.userId,
+      user_id: c.userId,
+      amount: c.amount,
+      name: c.name,
+    }));
+  }
+
+  if (exp.shares || exp.ratios) {
+    const raw = exp.shares ?? exp.ratios;
+    let ratioItems: RatioSplitItem[];
+    if (Array.isArray(raw)) {
+      ratioItems = raw.map((r) => {
+        const anyR = r as Record<string, unknown>;
+        return {
+          userId: resolveId(anyR.user_id ?? anyR.userId ?? anyR.id ?? anyR.name),
+          ratio: (anyR.ratio ?? anyR.shares ?? anyR.weight) as number,
+          name: (anyR.name ?? anyR.user_name) as string | null,
+        };
+      });
+    } else {
+      ratioItems = Object.entries(raw as Record<string, number>).map(([key, val]) => ({
+        userId: resolveId(key),
+        ratio: val,
+      }));
+    }
+    const calculated = calculateRatioSplits(amount, ratioItems);
+    return calculated.map((c) => ({
+      userId: c.userId,
+      user_id: c.userId,
+      amount: c.amount,
+      name: c.name,
+    }));
+  }
+
+  if (exp.percentages) {
+    let pctItems: PercentageSplitItem[];
+    if (Array.isArray(exp.percentages)) {
+      pctItems = exp.percentages.map((p) => {
+        const anyP = p as Record<string, unknown>;
+        return {
+          userId: resolveId(anyP.user_id ?? anyP.userId ?? anyP.id ?? anyP.name),
+          percentage: (anyP.percentage ?? anyP.percent ?? anyP.pct) as number,
+          name: (anyP.name ?? anyP.user_name) as string | null,
+        };
+      });
+    } else {
+      pctItems = Object.entries(exp.percentages as Record<string, number>).map(([key, val]) => ({
+        userId: resolveId(key),
+        percentage: val,
+      }));
+    }
+    const calculated = calculatePercentageSplits(amount, pctItems);
+    return calculated.map((c) => ({
+      userId: c.userId,
+      user_id: c.userId,
+      amount: c.amount,
+      name: c.name,
+    }));
+  }
+
+  if (exp.id !== undefined && separateSplitsByExpenseId.has(exp.id)) {
+    return separateSplitsByExpenseId.get(exp.id)!;
+  }
+
+  if (memberIdsList.length > 0) {
+    return distributeEqualSplits(amount, memberIdsList);
+  }
+
+  throw new BalanceEngineError(
+    `Expense ${exp.id ?? '(unidentified)'} has no splits and no group members were provided to compute splits`,
+    'INCONSISTENT_SPLITS'
+  );
+}
+
+/**
  * Process expenses, splits, and settlements into internal user balance states.
  */
 function processTransactions(
@@ -311,6 +809,7 @@ function processTransactions(
 
   // Register optional members
   const memberIdsList: number[] = [];
+  const memberNameToIdMap = new Map<string, number>();
   if (options.members !== undefined) {
     if (!Array.isArray(options.members)) {
       throw new BalanceEngineError('Options members must be an array', 'INVALID_INPUT');
@@ -321,6 +820,9 @@ function processTransactions(
         const uId = normalizeUserId(rawId);
         ensureUser(uId, m.name);
         memberIdsList.push(uId);
+        if (m.name) {
+          memberNameToIdMap.set(m.name.trim().toLowerCase(), uId);
+        }
       } else {
         const uId = normalizeUserId(m);
         ensureUser(uId);
@@ -359,19 +861,13 @@ function processTransactions(
     payer.paid = checkedAdd(payer.paid, amount, `paid amount for user ${payerId}`);
 
     // Resolve splits
-    let splits: ExpenseSplitInput[];
-    if (Array.isArray(exp.splits)) {
-      splits = exp.splits;
-    } else if (exp.id !== undefined && separateSplitsByExpenseId.has(exp.id)) {
-      splits = separateSplitsByExpenseId.get(exp.id)!;
-    } else if (memberIdsList.length > 0) {
-      splits = distributeEqualSplits(amount, memberIdsList);
-    } else {
-      throw new BalanceEngineError(
-        `Expense ${exp.id ?? '(unidentified)'} has no splits and no group members were provided to compute splits`,
-        'INCONSISTENT_SPLITS'
-      );
-    }
+    const splits = resolveEngineExpenseSplits(
+      exp,
+      amount,
+      memberIdsList,
+      separateSplitsByExpenseId,
+      memberNameToIdMap
+    );
 
     if (splits.length === 0) {
       throw new BalanceEngineError(
@@ -679,11 +1175,15 @@ export function calculatePairwiseDebts(
   const userNames = new Map<number, string>();
 
   // Register member names
+  const memberNameToIdMap = new Map<string, number>();
   if (Array.isArray(options.members)) {
     for (const m of options.members) {
       if (m && typeof m === 'object') {
         const uId = normalizeUserId(m.id ?? m.user_id ?? m.userId);
-        if (m.name) userNames.set(uId, m.name);
+        if (m.name) {
+          userNames.set(uId, m.name);
+          memberNameToIdMap.set(m.name.trim().toLowerCase(), uId);
+        }
       }
     }
   }
@@ -715,19 +1215,13 @@ export function calculatePairwiseDebts(
     const payerId = normalizeUserId(exp.paid_by ?? exp.payer_id);
     const amount = validateExpenseAmount(exp.amount);
 
-    let splits: ExpenseSplitInput[];
-    if (Array.isArray(exp.splits)) {
-      splits = exp.splits;
-    } else if (exp.id !== undefined && separateSplitsByExpenseId.has(exp.id)) {
-      splits = separateSplitsByExpenseId.get(exp.id)!;
-    } else if (memberIdsList.length > 0) {
-      splits = distributeEqualSplits(amount, memberIdsList);
-    } else {
-      throw new BalanceEngineError(
-        `Expense ${exp.id ?? '(unidentified)'} has no splits to calculate pairwise debts`,
-        'INCONSISTENT_SPLITS'
-      );
-    }
+    const splits = resolveEngineExpenseSplits(
+      exp,
+      amount,
+      memberIdsList,
+      separateSplitsByExpenseId,
+      memberNameToIdMap
+    );
 
     if (splits.length === 0) {
       throw new BalanceEngineError(
