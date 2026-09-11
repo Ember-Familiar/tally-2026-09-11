@@ -76,6 +76,14 @@ function clearExpenseFeedback() {
   clearFeedback('expense-feedback');
 }
 
+function showSettleFeedback(message, type) {
+  showFeedback(message, type, 'settle-feedback');
+}
+
+function clearSettleFeedback() {
+  clearFeedback('settle-feedback');
+}
+
 function updateGroupSelector(groups) {
   const groupSelect = document.getElementById('expense-group') || document.getElementById('expense-group-id');
   if (!groupSelect) return;
@@ -262,7 +270,13 @@ function selectGroup(groupId) {
     expensesSubtitle.textContent = `Viewing expenses for group #${parsedId}.`;
   }
 
+  const balancesSubtitle = document.getElementById('balances-subtitle');
+  if (balancesSubtitle) {
+    balancesSubtitle.textContent = `Viewing balances for group #${parsedId}.`;
+  }
+
   loadExpenses(parsedId);
+  loadBalances(parsedId);
 }
 
 // Load groups from GET /groups API
@@ -712,10 +726,482 @@ async function handleCreateExpense(e, explicitGroupId) {
       }
     }
 
-    // Refresh expenses list
+    // Refresh expenses list and balances
     await loadExpenses(groupId);
+    await loadBalances(groupId);
   } catch (err) {
     showExpenseFeedback(err.message || 'Failed to add expense. Please check input and try again.', 'error');
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      if (btnTextEl) {
+        btnTextEl.textContent = originalBtnText;
+      }
+    }
+  }
+}
+
+// Render group balance summary and settlement suggestions safely into DOM
+function renderBalances(balancesData) {
+  const balancesStatusEl = document.getElementById('balances-status-container');
+  const balancesContentEl = document.getElementById('balances-content');
+  const memberBalancesListEl = document.getElementById('member-balances-list');
+  const settlementsStatusEl = document.getElementById('settlements-status-container');
+  const settlementsListEl = document.getElementById('settlements-list');
+
+  if (balancesStatusEl) {
+    balancesStatusEl.replaceChildren();
+  }
+  if (memberBalancesListEl) {
+    memberBalancesListEl.replaceChildren();
+  }
+  if (settlementsStatusEl) {
+    settlementsStatusEl.replaceChildren();
+  }
+  if (settlementsListEl) {
+    settlementsListEl.replaceChildren();
+  }
+
+  if (!balancesData || typeof balancesData !== 'object') {
+    if (balancesStatusEl) {
+      const emptyContainer = document.createElement('div');
+      emptyContainer.className = 'state-container';
+
+      const icon = document.createElement('div');
+      icon.className = 'state-icon';
+      icon.textContent = '⚖️';
+
+      const title = document.createElement('div');
+      title.className = 'state-title';
+      title.textContent = 'No balance data';
+
+      const text = document.createElement('div');
+      text.className = 'state-text';
+      text.textContent = 'Balance summary could not be found for this group.';
+
+      emptyContainer.appendChild(icon);
+      emptyContainer.appendChild(title);
+      emptyContainer.appendChild(text);
+
+      balancesStatusEl.appendChild(emptyContainer);
+    }
+    return;
+  }
+
+  if (balancesContentEl) {
+    balancesContentEl.classList.remove('hidden');
+  }
+
+  // 1. Member Balances
+  const balancesList = Array.isArray(balancesData.balances) ? balancesData.balances : [];
+  if (memberBalancesListEl) {
+    if (balancesList.length === 0) {
+      const emptyCard = document.createElement('div');
+      emptyCard.className = 'state-container';
+      const text = document.createElement('div');
+      text.className = 'state-text';
+      text.textContent = 'No members in this group.';
+      emptyCard.appendChild(text);
+      memberBalancesListEl.appendChild(emptyCard);
+    } else {
+      balancesList.forEach((b) => {
+        const card = document.createElement('div');
+        card.className = 'balance-card';
+        const userId = b.user_id !== undefined ? b.user_id : b.userId;
+        if (userId !== undefined) {
+          card.setAttribute('data-user-id', String(userId));
+        }
+        const net = typeof b.net_balance === 'number' ? b.net_balance : (typeof b.balance === 'number' ? b.balance : 0);
+        card.setAttribute('data-net-balance', String(net));
+
+        // Header: Member Name & Net Balance
+        const header = document.createElement('div');
+        header.className = 'balance-card-header';
+
+        const nameEl = document.createElement('h4');
+        nameEl.className = 'member-name';
+        nameEl.textContent = b.name || ('User #' + userId);
+
+        const netEl = document.createElement('span');
+        netEl.className = 'net-balance-amount';
+        if (net > 0) {
+          netEl.classList.add('positive');
+          netEl.textContent = '+' + formatCents(net);
+        } else if (net < 0) {
+          netEl.classList.add('negative');
+          netEl.textContent = formatCents(net);
+        } else {
+          netEl.classList.add('zero');
+          netEl.textContent = formatCents(0);
+        }
+
+        header.appendChild(nameEl);
+        header.appendChild(netEl);
+        card.appendChild(header);
+
+        // Details: Status Tag & Spend/Owed Breakdown
+        const details = document.createElement('div');
+        details.className = 'balance-details';
+
+        const statusTag = document.createElement('span');
+        statusTag.className = 'balance-status-tag';
+        if (net > 0) {
+          statusTag.classList.add('tag-positive');
+          statusTag.textContent = 'Gets back ' + formatCents(net);
+        } else if (net < 0) {
+          statusTag.classList.add('tag-negative');
+          statusTag.textContent = 'Owes ' + formatCents(Math.abs(net));
+        } else {
+          statusTag.classList.add('tag-settled');
+          statusTag.textContent = 'Settled up';
+        }
+
+        const spendInfo = document.createElement('span');
+        spendInfo.className = 'balance-spend-info';
+        const paidCents = typeof b.paid === 'number' ? b.paid : 0;
+        const owedCents = typeof b.owed === 'number' ? b.owed : 0;
+        spendInfo.textContent = 'Paid ' + formatCents(paidCents) + ' • Owed ' + formatCents(owedCents);
+
+        details.appendChild(statusTag);
+        details.appendChild(spendInfo);
+        card.appendChild(details);
+
+        memberBalancesListEl.appendChild(card);
+      });
+    }
+  }
+
+  // 2. Settlement Suggestions
+  const settlements = Array.isArray(balancesData.settlements) ? balancesData.settlements : [];
+  if (settlements.length === 0) {
+    if (settlementsStatusEl) {
+      const settledContainer = document.createElement('div');
+      settledContainer.className = 'state-container settled-state';
+
+      const icon = document.createElement('div');
+      icon.className = 'state-icon';
+      icon.textContent = '🎉';
+
+      const title = document.createElement('div');
+      title.className = 'state-title';
+      title.textContent = 'All settled up!';
+
+      const text = document.createElement('div');
+      text.className = 'state-text';
+      text.textContent = 'No outstanding debts between group members.';
+
+      settledContainer.appendChild(icon);
+      settledContainer.appendChild(title);
+      settledContainer.appendChild(text);
+
+      settlementsStatusEl.appendChild(settledContainer);
+    }
+  } else if (settlementsListEl) {
+    settlements.forEach((s) => {
+      const card = document.createElement('div');
+      card.className = 'settlement-card';
+      const fromId = s.from !== undefined ? s.from : s.from_user_id;
+      const toId = s.to !== undefined ? s.to : s.to_user_id;
+      if (fromId !== undefined) card.setAttribute('data-from', String(fromId));
+      if (toId !== undefined) card.setAttribute('data-to', String(toId));
+      card.setAttribute('data-amount', String(s.amount));
+
+      const info = document.createElement('div');
+      info.className = 'settlement-info';
+
+      const fromName = s.from_name || ('User #' + fromId);
+      const toName = s.to_name || ('User #' + toId);
+      const amountStr = formatCents(s.amount);
+
+      const instruction = document.createElement('span');
+      instruction.className = 'settlement-instruction';
+
+      const fromBold = document.createElement('strong');
+      fromBold.className = 'settlement-from';
+      fromBold.textContent = fromName;
+
+      const owesText = document.createTextNode(' owes ');
+
+      const toBold = document.createElement('strong');
+      toBold.className = 'settlement-to';
+      toBold.textContent = toName;
+
+      const colonText = document.createTextNode(': ');
+
+      const amountBold = document.createElement('strong');
+      amountBold.className = 'settlement-amount';
+      amountBold.textContent = amountStr;
+
+      instruction.appendChild(fromBold);
+      instruction.appendChild(owesText);
+      instruction.appendChild(toBold);
+      instruction.appendChild(colonText);
+      instruction.appendChild(amountBold);
+
+      info.appendChild(instruction);
+      card.appendChild(info);
+
+      // Action button: Settle Up
+      const actionDiv = document.createElement('div');
+      actionDiv.className = 'settlement-action';
+
+      const settleBtn = document.createElement('button');
+      settleBtn.type = 'button';
+      settleBtn.className = 'btn btn-secondary btn-sm settle-btn';
+      settleBtn.textContent = 'Settle Up';
+      settleBtn.setAttribute('data-from', fromName);
+      settleBtn.setAttribute('data-to', toName);
+      settleBtn.setAttribute('data-amount', String(s.amount));
+
+      settleBtn.addEventListener('click', () => {
+        const payerInput = document.getElementById('settle-payer') || document.getElementById('settle-from');
+        const payeeInput = document.getElementById('settle-payee') || document.getElementById('settle-to');
+        const amountInput = document.getElementById('settle-amount');
+        const descInput = document.getElementById('settle-description') || document.getElementById('settle-desc');
+        const form = document.getElementById('settle-up-form') || document.getElementById('settle-form');
+
+        if (payerInput) payerInput.value = fromName;
+        if (payeeInput) payeeInput.value = toName;
+        if (amountInput) amountInput.value = String(s.amount);
+        if (descInput) descInput.value = 'Settlement to ' + toName;
+
+        if (form && typeof form.scrollIntoView === 'function') {
+          form.scrollIntoView({ behavior: 'smooth' });
+        }
+        if (amountInput && typeof amountInput.focus === 'function') {
+          amountInput.focus();
+        }
+      });
+
+      actionDiv.appendChild(settleBtn);
+      card.appendChild(actionDiv);
+
+      settlementsListEl.appendChild(card);
+    });
+  }
+}
+
+// Load balances from GET /groups/:id/balances API
+async function loadBalances(groupId) {
+  const balancesStatusEl = document.getElementById('balances-status-container');
+  const balancesContentEl = document.getElementById('balances-content');
+  const memberBalancesListEl = document.getElementById('member-balances-list');
+  const settlementsListEl = document.getElementById('settlements-list');
+  const settlementsStatusEl = document.getElementById('settlements-status-container');
+
+  if (memberBalancesListEl) {
+    memberBalancesListEl.replaceChildren();
+  }
+  if (settlementsListEl) {
+    settlementsListEl.replaceChildren();
+  }
+  if (settlementsStatusEl) {
+    settlementsStatusEl.replaceChildren();
+  }
+
+  if (!groupId) {
+    if (balancesStatusEl) {
+      balancesStatusEl.replaceChildren();
+      const emptyContainer = document.createElement('div');
+      emptyContainer.className = 'state-container';
+
+      const icon = document.createElement('div');
+      icon.className = 'state-icon';
+      icon.textContent = '⚖️';
+
+      const title = document.createElement('div');
+      title.className = 'state-title';
+      title.textContent = 'No group selected';
+
+      const text = document.createElement('div');
+      text.className = 'state-text';
+      text.textContent = 'Select a group above to view member balances and settlement suggestions.';
+
+      emptyContainer.appendChild(icon);
+      emptyContainer.appendChild(title);
+      emptyContainer.appendChild(text);
+
+      balancesStatusEl.appendChild(emptyContainer);
+    }
+    if (balancesContentEl) {
+      balancesContentEl.classList.add('hidden');
+    }
+    return;
+  }
+
+  if (balancesStatusEl) {
+    balancesStatusEl.replaceChildren();
+    const loadingContainer = document.createElement('div');
+    loadingContainer.className = 'state-container';
+
+    const text = document.createElement('div');
+    text.className = 'state-text';
+    text.textContent = 'Loading balances...';
+    loadingContainer.appendChild(text);
+    balancesStatusEl.appendChild(loadingContainer);
+  }
+
+  try {
+    const response = await fetch('/groups/' + groupId + '/balances', {
+      headers: { Accept: 'application/json' },
+    });
+
+    if (!response.ok) {
+      if (response.status >= 500) {
+        throw new Error('Server error occurred. Please try again later.');
+      }
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Failed to load balances (HTTP ${response.status})`);
+    }
+
+    const balancesData = await response.json();
+    renderBalances(balancesData);
+  } catch (err) {
+    if (balancesStatusEl) {
+      balancesStatusEl.replaceChildren();
+      const errContainer = document.createElement('div');
+      errContainer.className = 'state-container';
+
+      const icon = document.createElement('div');
+      icon.className = 'state-icon';
+      icon.textContent = '⚠️';
+
+      const title = document.createElement('div');
+      title.className = 'state-title';
+      title.textContent = 'Unable to load balances';
+
+      const textEl = document.createElement('div');
+      textEl.className = 'state-text';
+      textEl.textContent = err.message || 'Network error occurred. Please try again.';
+
+      errContainer.appendChild(icon);
+      errContainer.appendChild(title);
+      errContainer.appendChild(textEl);
+      balancesStatusEl.appendChild(errContainer);
+    }
+    if (balancesContentEl) {
+      balancesContentEl.classList.add('hidden');
+    }
+  }
+}
+
+// Handle Form Submit to Record Settlement
+async function handleSettleUp(e, explicitGroupId) {
+  if (e && typeof e.preventDefault === 'function') {
+    e.preventDefault();
+  }
+  clearSettleFeedback();
+
+  const form = document.getElementById('settle-up-form') || document.getElementById('settle-form');
+  const groupSelect = document.getElementById('expense-group') || document.getElementById('expense-group-id');
+  const payerInput = document.getElementById('settle-payer') || document.getElementById('settle-from');
+  const payeeInput = document.getElementById('settle-payee') || document.getElementById('settle-to');
+  const amountInput = document.getElementById('settle-amount');
+  const dateInput = document.getElementById('settle-date');
+  const descInput = document.getElementById('settle-description') || document.getElementById('settle-desc');
+  const submitBtn = document.getElementById('settle-btn') || document.getElementById('settle-up-btn');
+
+  let groupId = explicitGroupId;
+  if (!groupId && (typeof e === 'number' || (typeof e === 'string' && /^[1-9]\d*$/.test(e)))) {
+    groupId = Number(e);
+  }
+  if (!groupId && groupSelect && groupSelect.value) {
+    const parsed = Number(groupSelect.value);
+    if (!isNaN(parsed) && parsed > 0) {
+      groupId = parsed;
+    }
+  }
+  if (!groupId && currentGroupId) {
+    groupId = currentGroupId;
+  }
+
+  if (!groupId) {
+    showSettleFeedback('Please select a group first.', 'error');
+    return;
+  }
+
+  const rawPayer = payerInput ? payerInput.value.trim() : '';
+  const rawPayee = payeeInput ? payeeInput.value.trim() : '';
+  const rawAmountStr = amountInput ? amountInput.value.trim() : '';
+  const rawDate = dateInput ? dateInput.value.trim() : '';
+  const rawDesc = descInput ? descInput.value.trim() : '';
+
+  const groupMembers = getGroupMembers(groupId);
+  function resolveParticipant(val) {
+    if (!val) return '';
+    const matchesName = groupMembers.some((m) => {
+      const name = typeof m === 'object' && m !== null ? m.name : String(m);
+      return name.trim().toLowerCase() === val.toLowerCase();
+    });
+    if (matchesName) {
+      return val;
+    } else if (/^[1-9]\d*$/.test(val)) {
+      return Number(val);
+    }
+    return val;
+  }
+
+  const payload = {};
+  if (rawPayer !== '') {
+    payload.from = resolveParticipant(rawPayer);
+  }
+  if (rawPayee !== '') {
+    payload.to = resolveParticipant(rawPayee);
+  }
+  if (rawAmountStr !== '') {
+    const num = Number(rawAmountStr);
+    payload.amount = isNaN(num) ? rawAmountStr : num;
+  }
+  if (rawDate !== '') {
+    payload.date = rawDate;
+  }
+  if (rawDesc !== '') {
+    payload.description = rawDesc;
+  }
+
+  let btnTextEl = null;
+  let originalBtnText = 'Record Settlement';
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    btnTextEl = submitBtn.querySelector('.btn-text');
+    if (btnTextEl) {
+      originalBtnText = btnTextEl.textContent;
+      btnTextEl.textContent = 'Recording...';
+    }
+  }
+
+  try {
+    const response = await fetch('/groups/' + groupId + '/settle', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      if (response.status >= 500) {
+        throw new Error('Server error occurred. Please try again later.');
+      }
+      throw new Error(data.error || `Error recording settlement (HTTP ${response.status})`);
+    }
+
+    const fromName = data.from_name || ('User #' + (data.from || data.from_user_id));
+    const toName = data.to_name || ('User #' + (data.to || data.to_user_id));
+    const formatted = formatCents(data.amount);
+    showSettleFeedback(`Settlement of ${formatted} from ${fromName} to ${toName} recorded successfully!`, 'success');
+
+    if (form && typeof form.reset === 'function') {
+      form.reset();
+    }
+
+    // Refresh balances view
+    await loadBalances(groupId);
+  } catch (err) {
+    showSettleFeedback(err.message || 'Failed to record settlement. Please check input and try again.', 'error');
   } finally {
     if (submitBtn) {
       submitBtn.disabled = false;
@@ -733,6 +1219,9 @@ function initApp() {
   const expenseForm = document.getElementById('add-expense-form');
   const refreshExpensesBtn = document.getElementById('refresh-expenses-btn');
   const groupSelect = document.getElementById('expense-group') || document.getElementById('expense-group-id');
+
+  const settleForm = document.getElementById('settle-up-form') || document.getElementById('settle-form');
+  const refreshBalancesBtn = document.getElementById('refresh-balances-btn');
 
   if (groupForm) {
     groupForm.addEventListener('submit', handleCreateGroup);
@@ -765,12 +1254,29 @@ function initApp() {
       } else {
         currentGroupId = null;
         loadExpenses(null);
+        loadBalances(null);
+      }
+    });
+  }
+
+  if (settleForm) {
+    settleForm.addEventListener('submit', handleSettleUp);
+  }
+  if (refreshBalancesBtn) {
+    refreshBalancesBtn.addEventListener('click', () => {
+      let gid = currentGroupId;
+      if (!gid && groupSelect && groupSelect.value) {
+        gid = Number(groupSelect.value);
+      }
+      if (gid) {
+        loadBalances(gid);
       }
     });
   }
 
   loadGroups();
   loadExpenses(null);
+  loadBalances(null);
 }
 
 if (typeof document !== 'undefined') {
@@ -789,12 +1295,17 @@ if (typeof module !== 'undefined' && module.exports) {
     clearFeedback,
     showExpenseFeedback,
     clearExpenseFeedback,
+    showSettleFeedback,
+    clearSettleFeedback,
     renderGroups,
     loadGroups,
     handleCreateGroup,
     renderExpenses,
     loadExpenses,
     handleCreateExpense,
+    renderBalances,
+    loadBalances,
+    handleSettleUp,
     selectGroup,
     initApp,
   };
@@ -807,12 +1318,17 @@ if (typeof window !== 'undefined') {
     clearFeedback,
     showExpenseFeedback,
     clearExpenseFeedback,
+    showSettleFeedback,
+    clearSettleFeedback,
     renderGroups,
     loadGroups,
     handleCreateGroup,
     renderExpenses,
     loadExpenses,
     handleCreateExpense,
+    renderBalances,
+    loadBalances,
+    handleSettleUp,
     selectGroup,
     initApp,
   };

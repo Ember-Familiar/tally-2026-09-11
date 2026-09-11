@@ -22,12 +22,17 @@ interface TallyAppExports {
   clearFeedback: (elementId?: string) => void;
   showExpenseFeedback: (message: string, type: string) => void;
   clearExpenseFeedback: () => void;
+  showSettleFeedback: (message: string, type: string) => void;
+  clearSettleFeedback: () => void;
   renderGroups: (groups: unknown[]) => void;
   loadGroups: () => Promise<void>;
   handleCreateGroup: (e?: Event) => Promise<void>;
   renderExpenses: (expenses: unknown[]) => void;
   loadExpenses: (groupId: number | null) => Promise<void>;
   handleCreateExpense: (e?: Event | number, explicitGroupId?: number) => Promise<void>;
+  renderBalances: (balancesData: unknown) => void;
+  loadBalances: (groupId: number | null) => Promise<void>;
+  handleSettleUp: (e?: Event | number, explicitGroupId?: number) => Promise<void>;
   selectGroup: (groupId: number) => void;
   initApp: () => void;
 }
@@ -1209,6 +1214,754 @@ describe('Task 11: Group list/create Web UI', () => {
     });
   });
 
+  describe('Task 13: Balances view and settle-up UI', () => {
+    function setupDom(fetchMock: FetchMock) {
+      const htmlPath = path.resolve(__dirname, '../public/index.html');
+      const appJsPath = path.resolve(__dirname, '../public/app.js');
+      const html = fs.readFileSync(htmlPath, 'utf8');
+      const js = fs.readFileSync(appJsPath, 'utf8');
+
+      const dom = new JSDOM(html, {
+        runScripts: 'outside-only',
+        url: 'http://localhost:3000/',
+      });
+
+      const { window } = dom;
+      const customWindow = window as unknown as CustomWindow;
+      customWindow.fetch = fetchMock;
+
+      window.eval(js);
+
+      return {
+        dom,
+        window,
+        document: window.document,
+        tallyApp: customWindow.TallyApp,
+      };
+    }
+
+    it('renders per-member net position with paid, owed, formatted net balance, and status tags', async () => {
+      const balancesData = {
+        balances: [
+          {
+            user_id: 1,
+            name: 'Alice',
+            paid: 6000,
+            owed: 2000,
+            net_balance: 4000,
+          },
+          {
+            user_id: 2,
+            name: 'Bob',
+            paid: 0,
+            owed: 2000,
+            net_balance: -2000,
+          },
+          {
+            user_id: 3,
+            name: 'Charlie',
+            paid: 2000,
+            owed: 2000,
+            net_balance: 0,
+          },
+        ],
+        net_balances: { '1': 4000, '2': -2000, '3': 0 },
+        settlements: [
+          {
+            from: 2,
+            to: 1,
+            from_name: 'Bob',
+            to_name: 'Alice',
+            amount: 2000,
+          },
+        ],
+        pairwise: [],
+        total_spend: 6000,
+      };
+
+      const fetchMock: FetchMock = async (url: string) => {
+        if (url === '/groups/10/balances') {
+          return { ok: true, status: 200, json: async () => balancesData };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadBalances(10);
+
+      const balancesList = document.getElementById('member-balances-list')!;
+      expect(balancesList.children.length).toBe(3);
+
+      // Card 1: Alice (+$40.00)
+      const aliceCard = balancesList.children[0];
+      expect(aliceCard.getAttribute('data-user-id')).toBe('1');
+      expect(aliceCard.getAttribute('data-net-balance')).toBe('4000');
+      expect(aliceCard.querySelector('.member-name')!.textContent).toBe('Alice');
+      const aliceNet = aliceCard.querySelector('.net-balance-amount')!;
+      expect(aliceNet.textContent).toBe('+$40.00');
+      expect(aliceNet.classList.contains('positive')).toBe(true);
+      const aliceTag = aliceCard.querySelector('.balance-status-tag')!;
+      expect(aliceTag.textContent).toBe('Gets back $40.00');
+      expect(aliceTag.classList.contains('tag-positive')).toBe(true);
+      expect(aliceCard.querySelector('.balance-spend-info')!.textContent).toContain('Paid $60.00');
+      expect(aliceCard.querySelector('.balance-spend-info')!.textContent).toContain('Owed $20.00');
+
+      // Card 2: Bob (-$20.00)
+      const bobCard = balancesList.children[1];
+      expect(bobCard.getAttribute('data-user-id')).toBe('2');
+      expect(bobCard.getAttribute('data-net-balance')).toBe('-2000');
+      expect(bobCard.querySelector('.member-name')!.textContent).toBe('Bob');
+      const bobNet = bobCard.querySelector('.net-balance-amount')!;
+      expect(bobNet.textContent).toBe('-$20.00');
+      expect(bobNet.classList.contains('negative')).toBe(true);
+      const bobTag = bobCard.querySelector('.balance-status-tag')!;
+      expect(bobTag.textContent).toBe('Owes $20.00');
+      expect(bobTag.classList.contains('tag-negative')).toBe(true);
+      expect(bobCard.querySelector('.balance-spend-info')!.textContent).toContain('Paid $0.00');
+      expect(bobCard.querySelector('.balance-spend-info')!.textContent).toContain('Owed $20.00');
+
+      // Card 3: Charlie ($0.00)
+      const charlieCard = balancesList.children[2];
+      expect(charlieCard.getAttribute('data-user-id')).toBe('3');
+      expect(charlieCard.getAttribute('data-net-balance')).toBe('0');
+      expect(charlieCard.querySelector('.member-name')!.textContent).toBe('Charlie');
+      const charlieNet = charlieCard.querySelector('.net-balance-amount')!;
+      expect(charlieNet.textContent).toBe('$0.00');
+      expect(charlieNet.classList.contains('zero')).toBe(true);
+      const charlieTag = charlieCard.querySelector('.balance-status-tag')!;
+      expect(charlieTag.textContent).toBe('Settled up');
+      expect(charlieTag.classList.contains('tag-settled')).toBe(true);
+      expect(charlieCard.querySelector('.balance-spend-info')!.textContent).toContain('Paid $20.00');
+      expect(charlieCard.querySelector('.balance-spend-info')!.textContent).toContain('Owed $20.00');
+
+      // Content wrapper is visible
+      const contentEl = document.getElementById('balances-content')!;
+      expect(contentEl.classList.contains('hidden')).toBe(false);
+    });
+
+    it('renders settlement suggestions with formatted cents and prefill action button', async () => {
+      const balancesData = {
+        balances: [
+          { user_id: 1, name: 'Alice', paid: 6000, owed: 2000, net_balance: 4000 },
+          { user_id: 2, name: 'Bob', paid: 0, owed: 2000, net_balance: -2000 },
+          { user_id: 3, name: 'Charlie', paid: 0, owed: 2000, net_balance: -2000 },
+        ],
+        net_balances: { '1': 4000, '2': -2000, '3': -2000 },
+        settlements: [
+          { from: 2, to: 1, from_name: 'Bob', to_name: 'Alice', amount: 2000 },
+          { from: 3, to: 1, from_name: 'Charlie', to_name: 'Alice', amount: 2000 },
+        ],
+        pairwise: [],
+        total_spend: 6000,
+      };
+
+      const fetchMock: FetchMock = async (url: string) => {
+        if (url === '/groups/10/balances') {
+          return { ok: true, status: 200, json: async () => balancesData };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadBalances(10);
+
+      const settlementsList = document.getElementById('settlements-list')!;
+      expect(settlementsList.children.length).toBe(2);
+
+      const firstSettle = settlementsList.children[0];
+      expect(firstSettle.getAttribute('data-from')).toBe('2');
+      expect(firstSettle.getAttribute('data-to')).toBe('1');
+      expect(firstSettle.getAttribute('data-amount')).toBe('2000');
+      expect(firstSettle.querySelector('.settlement-from')!.textContent).toBe('Bob');
+      expect(firstSettle.querySelector('.settlement-to')!.textContent).toBe('Alice');
+      expect(firstSettle.querySelector('.settlement-amount')!.textContent).toBe('$20.00');
+
+      const secondSettle = settlementsList.children[1];
+      expect(secondSettle.getAttribute('data-from')).toBe('3');
+      expect(secondSettle.getAttribute('data-to')).toBe('1');
+      expect(secondSettle.getAttribute('data-amount')).toBe('2000');
+      expect(secondSettle.querySelector('.settlement-from')!.textContent).toBe('Charlie');
+      expect(secondSettle.querySelector('.settlement-to')!.textContent).toBe('Alice');
+      expect(secondSettle.querySelector('.settlement-amount')!.textContent).toBe('$20.00');
+
+      // Click "Settle Up" on first suggestion prefills the settle form
+      const settleBtn = firstSettle.querySelector('.settle-btn') as HTMLButtonElement;
+      expect(settleBtn).not.toBeNull();
+      expect(settleBtn.getAttribute('data-from')).toBe('Bob');
+      expect(settleBtn.getAttribute('data-to')).toBe('Alice');
+      expect(settleBtn.getAttribute('data-amount')).toBe('2000');
+      settleBtn.click();
+
+      const payerInput = (document.getElementById('settle-payer') || document.getElementById('settle-from')) as HTMLInputElement;
+      const payeeInput = (document.getElementById('settle-payee') || document.getElementById('settle-to')) as HTMLInputElement;
+      const amountInput = document.getElementById('settle-amount') as HTMLInputElement;
+
+      expect(payerInput.value).toBe('Bob');
+      expect(payeeInput.value).toBe('Alice');
+      expect(amountInput.value).toBe('2000');
+      expect(amountInput.getAttribute('inputmode')).toBe('numeric');
+    });
+
+    it('renders "All settled up!" empty state when group balances are zero or no debts exist', async () => {
+      const balancesData = {
+        balances: [
+          { user_id: 1, name: 'Alice', paid: 0, owed: 0, net_balance: 0 },
+          { user_id: 2, name: 'Bob', paid: 0, owed: 0, net_balance: 0 },
+        ],
+        net_balances: { '1': 0, '2': 0 },
+        settlements: [],
+        pairwise: [],
+        total_spend: 0,
+      };
+
+      const fetchMock: FetchMock = async (url: string) => {
+        if (url === '/groups/10/balances') {
+          return { ok: true, status: 200, json: async () => balancesData };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadBalances(10);
+
+      const settlementsStatus = document.getElementById('settlements-status-container')!;
+      expect(settlementsStatus.children.length).toBe(1);
+      expect(settlementsStatus.querySelector('.state-title')!.textContent).toBe('All settled up!');
+      expect(settlementsStatus.querySelector('.state-text')!.textContent).toContain('No outstanding debts');
+
+      const settlementsList = document.getElementById('settlements-list')!;
+      expect(settlementsList.children.length).toBe(0);
+    });
+
+    it('renders "No group selected" state when groupId is null', async () => {
+      const fetchMock: FetchMock = async (url: string) => {
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadBalances(null);
+
+      const statusContainer = document.getElementById('balances-status-container')!;
+      expect(statusContainer.querySelector('.state-title')!.textContent).toBe('No group selected');
+      expect(statusContainer.querySelector('.state-text')!.textContent).toContain('Select a group above');
+
+      const contentEl = document.getElementById('balances-content')!;
+      expect(contentEl.classList.contains('hidden')).toBe(true);
+    });
+
+    it('surfaces error when loading balances fails', async () => {
+      const fetchMock: FetchMock = async (url: string) => {
+        if (url === '/groups/10/balances') {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({ error: 'Internal server error' }),
+          };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadBalances(10);
+
+      const statusContainer = document.getElementById('balances-status-container')!;
+      expect(statusContainer.querySelector('.state-title')!.textContent).toBe('Unable to load balances');
+      expect(statusContainer.querySelector('.state-text')!.textContent).toContain('Server error occurred');
+
+      const contentEl = document.getElementById('balances-content')!;
+      expect(contentEl.classList.contains('hidden')).toBe(true);
+    });
+
+    it('Safe-DOM behavioural test: renders hostile member names and participant names as literal text with zero injected elements', async () => {
+      const hostileMemberName = '<img src=x onerror=alert(1)>';
+      const hostileDebtorName = '<script>alert("xss")</script>';
+      const hostileCreditorName = '<svg onload=alert(2)>';
+
+      const balancesData = {
+        balances: [
+          {
+            user_id: 1,
+            name: hostileMemberName,
+            paid: 4000,
+            owed: 2000,
+            net_balance: 2000,
+          },
+          {
+            user_id: 2,
+            name: hostileDebtorName,
+            paid: 0,
+            owed: 2000,
+            net_balance: -2000,
+          },
+        ],
+        net_balances: { '1': 2000, '2': -2000 },
+        settlements: [
+          {
+            from: 2,
+            to: 1,
+            from_name: hostileDebtorName,
+            to_name: hostileCreditorName,
+            amount: 2000,
+          },
+        ],
+        pairwise: [],
+        total_spend: 4000,
+      };
+
+      const fetchMock: FetchMock = async (url: string) => {
+        if (url === '/groups/10/balances') {
+          return { ok: true, status: 200, json: async () => balancesData };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadBalances(10);
+
+      const balancesList = document.getElementById('member-balances-list')!;
+      const settlementsList = document.getElementById('settlements-list')!;
+
+      const member1NameEl = balancesList.children[0].querySelector('.member-name')!;
+      const member2NameEl = balancesList.children[1].querySelector('.member-name')!;
+      const settlementFromEl = settlementsList.querySelector('.settlement-from')!;
+      const settlementToEl = settlementsList.querySelector('.settlement-to')!;
+
+      // 1. TextContent must match raw hostile strings byte-for-byte
+      expect(member1NameEl.textContent).toBe(hostileMemberName);
+      expect(member2NameEl.textContent).toBe(hostileDebtorName);
+      expect(settlementFromEl.textContent).toBe(hostileDebtorName);
+      expect(settlementToEl.textContent).toBe(hostileCreditorName);
+
+      // 2. Zero injected elements anywhere in DOM
+      expect(member1NameEl.querySelector('img')).toBeNull();
+      expect(member2NameEl.querySelector('script')).toBeNull();
+      expect(settlementFromEl.querySelector('script')).toBeNull();
+      expect(settlementToEl.querySelector('svg')).toBeNull();
+      expect(balancesList.querySelector('img')).toBeNull();
+      expect(balancesList.querySelector('script')).toBeNull();
+      expect(balancesList.querySelector('svg')).toBeNull();
+      expect(settlementsList.querySelector('img')).toBeNull();
+      expect(settlementsList.querySelector('script')).toBeNull();
+      expect(settlementsList.querySelector('svg')).toBeNull();
+      expect(document.querySelector('img')).toBeNull();
+      expect(document.querySelector('svg')).toBeNull();
+      const scripts = document.querySelectorAll('script');
+      expect(scripts.length).toBe(1);
+      expect(scripts[0].getAttribute('src')).toBe('/app.js');
+
+      // 3. Child nodes must be text nodes only
+      expect(member1NameEl.children.length).toBe(0);
+      expect(member1NameEl.childNodes.length).toBe(1);
+      expect(member1NameEl.childNodes[0].nodeType).toBe(3); // Node.TEXT_NODE
+      expect(settlementFromEl.children.length).toBe(0);
+      expect(settlementFromEl.childNodes.length).toBe(1);
+      expect(settlementFromEl.childNodes[0].nodeType).toBe(3);
+
+      // 4. In innerHTML serialization, special characters are entity-escaped
+      expect(member1NameEl.innerHTML).toBe('&lt;img src=x onerror=alert(1)&gt;');
+      expect(settlementFromEl.innerHTML).toBe('&lt;script&gt;alert("xss")&lt;/script&gt;');
+      expect(settlementToEl.innerHTML).toBe('&lt;svg onload=alert(2)&gt;');
+    });
+
+    it('handles successful settlement submission: posts payload, displays feedback, resets form, and refreshes balances', async () => {
+      let postedPayload: Record<string, unknown> | null = null;
+      let loadBalancesCallCount = 0;
+
+      const groupsData = [
+        {
+          id: 10,
+          name: 'Ski Trip',
+          created_at: '2026-09-05 10:00:00',
+          members: [
+            { id: 1, name: 'Alice' },
+            { id: 2, name: 'Bob' },
+          ],
+        },
+      ];
+
+      const initialBalances = {
+        balances: [
+          { user_id: 1, name: 'Alice', paid: 4000, owed: 2000, net_balance: 2000 },
+          { user_id: 2, name: 'Bob', paid: 0, owed: 2000, net_balance: -2000 },
+        ],
+        net_balances: { '1': 2000, '2': -2000 },
+        settlements: [{ from: 2, to: 1, from_name: 'Bob', to_name: 'Alice', amount: 2000 }],
+        pairwise: [],
+        total_spend: 4000,
+      };
+
+      const settledBalances = {
+        balances: [
+          { user_id: 1, name: 'Alice', paid: 4000, owed: 2000, net_balance: 0 },
+          { user_id: 2, name: 'Bob', paid: 2000, owed: 2000, net_balance: 0 },
+        ],
+        net_balances: { '1': 0, '2': 0 },
+        settlements: [],
+        pairwise: [],
+        total_spend: 4000,
+      };
+
+      const fetchMock: FetchMock = async (url: string, options?: RequestInit) => {
+        if (url === '/groups') {
+          return { ok: true, status: 200, json: async () => groupsData };
+        }
+        if (url === '/groups/10/balances') {
+          loadBalancesCallCount++;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => (postedPayload ? settledBalances : initialBalances),
+          };
+        }
+        if (url === '/groups/10/settle' && options?.method === 'POST') {
+          postedPayload = JSON.parse(options.body as string);
+          return {
+            ok: true,
+            status: 201,
+            json: async () => ({
+              id: 1,
+              group_id: 10,
+              from: 2,
+              to: 1,
+              from_name: 'Bob',
+              to_name: 'Alice',
+              amount: 2000,
+              description: 'Paid back Alice',
+              date: '2026-09-06 14:00:00',
+              created_at: '2026-09-06 14:00:00',
+            }),
+          };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadGroups();
+      tallyApp.selectGroup(10);
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(loadBalancesCallCount).toBe(1);
+
+      const payerInput = (document.getElementById('settle-payer') || document.getElementById('settle-from')) as HTMLInputElement;
+      const payeeInput = (document.getElementById('settle-payee') || document.getElementById('settle-to')) as HTMLInputElement;
+      const amountInput = document.getElementById('settle-amount') as HTMLInputElement;
+      const descInput = (document.getElementById('settle-description') || document.getElementById('settle-desc')) as HTMLInputElement;
+      const dateInput = document.getElementById('settle-date') as HTMLInputElement;
+      const feedback = document.getElementById('settle-feedback')!;
+
+      payerInput.value = 'Bob';
+      payeeInput.value = 'Alice';
+      amountInput.value = '2000';
+      descInput.value = 'Paid back Alice';
+      dateInput.value = '2026-09-06 14:00:00';
+
+      await tallyApp.handleSettleUp(undefined, 10);
+
+      // 1. Check posted payload
+      expect(postedPayload).toEqual({
+        from: 'Bob',
+        to: 'Alice',
+        amount: 2000,
+        description: 'Paid back Alice',
+        date: '2026-09-06 14:00:00',
+      });
+
+      // 2. Feedback shows success with formatted cents
+      expect(feedback.textContent).toContain('Settlement of $20.00 from Bob to Alice recorded successfully!');
+      expect(feedback.className).toContain('feedback-message success');
+
+      // 3. Form is reset
+      expect(payerInput.value).toBe('');
+      expect(payeeInput.value).toBe('');
+      expect(amountInput.value).toBe('');
+
+      // 4. Balances view refreshed automatically without reload
+      expect(loadBalancesCallCount).toBe(2);
+      const settlementsStatus = document.getElementById('settlements-status-container')!;
+      expect(settlementsStatus.textContent).toContain('All settled up!');
+    });
+
+    it('surfaces server validation errors verbatim on settle-up', async () => {
+      const fetchMock: FetchMock = async (url: string, options?: RequestInit) => {
+        if (url === '/groups/10/settle' && options?.method === 'POST') {
+          const body = JSON.parse(options.body as string);
+          if (body.from === body.to) {
+            return {
+              ok: false,
+              status: 400,
+              json: async () => ({ error: 'Cannot settle with self' }),
+            };
+          }
+          if (!body.amount) {
+            return {
+              ok: false,
+              status: 400,
+              json: async () => ({ error: 'Amount is required' }),
+            };
+          }
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      const payerInput = (document.getElementById('settle-payer') || document.getElementById('settle-from')) as HTMLInputElement;
+      const payeeInput = (document.getElementById('settle-payee') || document.getElementById('settle-to')) as HTMLInputElement;
+      const amountInput = document.getElementById('settle-amount') as HTMLInputElement;
+      const feedback = document.getElementById('settle-feedback')!;
+
+      // 1. Self settlement
+      payerInput.value = 'Alice';
+      payeeInput.value = 'Alice';
+      amountInput.value = '1000';
+
+      await tallyApp.handleSettleUp(undefined, 10);
+      expect(feedback.textContent).toBe('Cannot settle with self');
+      expect(feedback.className).toContain('feedback-message error');
+
+      // 2. Missing amount
+      payerInput.value = 'Bob';
+      payeeInput.value = 'Alice';
+      amountInput.value = '';
+
+      await tallyApp.handleSettleUp(undefined, 10);
+      expect(feedback.textContent).toBe('Amount is required');
+      expect(feedback.className).toContain('feedback-message error');
+    });
+
+    it('surfaces server-rejected settle-up errors (validation: amount format)', async () => {
+      let postPayload: Record<string, unknown> | null = null;
+      const fetchMock: FetchMock = async (url: string, options?: RequestInit) => {
+        if (url === '/groups/10/settle' && options?.method === 'POST') {
+          postPayload = JSON.parse(options.body as string);
+          return {
+            ok: false,
+            status: 400,
+            json: async () => ({ error: 'Amount must be a positive integer in cents' }),
+          };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      const payerInput = (document.getElementById('settle-payer') || document.getElementById('settle-from')) as HTMLInputElement;
+      const payeeInput = (document.getElementById('settle-payee') || document.getElementById('settle-to')) as HTMLInputElement;
+      const amountInput = document.getElementById('settle-amount') as HTMLInputElement;
+      const feedback = document.getElementById('settle-feedback')!;
+
+      payerInput.value = 'Bob';
+      payeeInput.value = 'Alice';
+      amountInput.value = 'abc';
+
+      await tallyApp.handleSettleUp(undefined, 10);
+
+      expect(postPayload).toEqual({
+        from: 'Bob',
+        to: 'Alice',
+        amount: 'abc',
+      });
+      expect(feedback.textContent).toBe('Amount must be a positive integer in cents');
+      expect(feedback.className).toContain('feedback-message error');
+    });
+
+    it('surfaces sanitized generic error when settle-up encounters 500 server error', async () => {
+      const fetchMock: FetchMock = async (url: string, options?: RequestInit) => {
+        if (url === '/groups/10/settle' && options?.method === 'POST') {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({ error: 'Database constraint failed with internal details' }),
+          };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      const payerInput = (document.getElementById('settle-payer') || document.getElementById('settle-from')) as HTMLInputElement;
+      const payeeInput = (document.getElementById('settle-payee') || document.getElementById('settle-to')) as HTMLInputElement;
+      const amountInput = document.getElementById('settle-amount') as HTMLInputElement;
+      const feedback = document.getElementById('settle-feedback')!;
+
+      payerInput.value = 'Bob';
+      payeeInput.value = 'Alice';
+      amountInput.value = '1000';
+
+      await tallyApp.handleSettleUp(undefined, 10);
+      expect(feedback.textContent).toBe('Server error occurred. Please try again later.');
+      expect(feedback.className).toContain('feedback-message error');
+    });
+
+    it('selecting a group updates dropdown, highlights card, loads expenses, and loads balances', async () => {
+      const groupsData = [
+        {
+          id: 10,
+          name: 'Beach Trip',
+          created_at: '2026-09-05 10:00:00',
+          members: [{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }],
+        },
+      ];
+
+      let loadedExpensesGroupId: number | null = null;
+      let loadedBalancesGroupId: number | null = null;
+
+      const fetchMock: FetchMock = async (url: string) => {
+        if (url === '/groups') {
+          return { ok: true, status: 200, json: async () => groupsData };
+        }
+        if (url === '/groups/10/expenses') {
+          loadedExpensesGroupId = 10;
+          return { ok: true, status: 200, json: async () => [] };
+        }
+        if (url === '/groups/10/balances') {
+          loadedBalancesGroupId = 10;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              balances: [
+                { user_id: 1, name: 'Alice', paid: 0, owed: 0, net_balance: 0 },
+                { user_id: 2, name: 'Bob', paid: 0, owed: 0, net_balance: 0 },
+              ],
+              net_balances: { '1': 0, '2': 0 },
+              settlements: [],
+              pairwise: [],
+              total_spend: 0,
+            }),
+          };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadGroups();
+
+      const groupCard = document.querySelector('.group-card')!;
+      const viewBtn = groupCard.querySelector('.select-group-btn') as HTMLButtonElement;
+      viewBtn.click();
+
+      expect(groupCard.classList.contains('active')).toBe(true);
+      expect(loadedExpensesGroupId).toBe(10);
+      expect(loadedBalancesGroupId).toBe(10);
+
+      const balancesSubtitle = document.getElementById('balances-subtitle')!;
+      expect(balancesSubtitle.textContent).toBe('Viewing balances for group #10.');
+    });
+
+    it('adding an expense refreshes the balances view and settlement suggestions', async () => {
+      const groupsData = [
+        {
+          id: 10,
+          name: 'Ski Trip',
+          created_at: '2026-09-06 10:00:00',
+          members: [
+            { id: 1, name: 'Ann' },
+            { id: 2, name: 'Bo' },
+          ],
+        },
+      ];
+
+      let balancesFetchCount = 0;
+
+      const initialBalances = {
+        balances: [
+          { user_id: 1, name: 'Ann', paid: 1000, owed: 500, net_balance: 500 },
+          { user_id: 2, name: 'Bo', paid: 0, owed: 500, net_balance: -500 },
+        ],
+        net_balances: { '1': 500, '2': -500 },
+        settlements: [
+          { from: 2, to: 1, amount: 500, from_name: 'Bo', to_name: 'Ann' },
+        ],
+        pairwise: [{ from: 2, to: 1, amount: 500 }],
+        total_spend: 1000,
+      };
+
+      const updatedBalances = {
+        balances: [
+          { user_id: 1, name: 'Ann', paid: 1000, owed: 2500, net_balance: -1500 },
+          { user_id: 2, name: 'Bo', paid: 4000, owed: 2500, net_balance: 1500 },
+        ],
+        net_balances: { '1': -1500, '2': 1500 },
+        settlements: [
+          { from: 1, to: 2, amount: 1500, from_name: 'Ann', to_name: 'Bo' },
+        ],
+        pairwise: [{ from: 1, to: 2, amount: 1500 }],
+        total_spend: 5000,
+      };
+
+      const fetchMock: FetchMock = async (url: string, options?: RequestInit) => {
+        if (url === '/groups') {
+          return { ok: true, status: 200, json: async () => groupsData };
+        }
+        if (url === '/groups/10/balances') {
+          balancesFetchCount++;
+          const data = balancesFetchCount === 1 ? initialBalances : updatedBalances;
+          return { ok: true, status: 200, json: async () => data };
+        }
+        if (url === '/groups/10/expenses' && options?.method === 'POST') {
+          return {
+            ok: true,
+            status: 201,
+            json: async () => ({
+              id: 2,
+              group_id: 10,
+              amount: 4000,
+              description: 'second',
+              paid_by: 2,
+              date: '2026-09-06 12:00:00',
+              created_at: '2026-09-06 12:00:00',
+              splits: [
+                { user_id: 1, amount: 2000 },
+                { user_id: 2, amount: 2000 },
+              ],
+            }),
+          };
+        }
+        if (url === '/groups/10/expenses') {
+          return { ok: true, status: 200, json: async () => [] };
+        }
+        throw new Error(`Unexpected url: ${url}`);
+      };
+
+      const { document, tallyApp } = setupDom(fetchMock);
+      await tallyApp.loadGroups();
+
+      const groupSelect = document.getElementById('expense-group') as HTMLSelectElement;
+      const opt = document.createElement('option');
+      opt.value = '10';
+      opt.textContent = 'Ski Trip';
+      opt.selected = true;
+      groupSelect.appendChild(opt);
+
+      // Initially load balances for group 10
+      await tallyApp.loadBalances(10);
+
+      const settlementsList = document.getElementById('settlements-list')!;
+      expect(balancesFetchCount).toBe(1);
+      expect(settlementsList.textContent).toContain('Bo owes Ann: $5.00');
+
+      // Populate and submit add-expense form
+      const descInput = document.getElementById('expense-description') as HTMLInputElement;
+      const amountInput = document.getElementById('expense-amount') as HTMLInputElement;
+      const payerInput = document.getElementById('expense-payer') as HTMLInputElement;
+      descInput.value = 'second';
+      amountInput.value = '4000';
+      payerInput.value = 'Bo';
+
+      await tallyApp.handleCreateExpense();
+
+      // Adding an expense must refresh the balances view
+      expect(balancesFetchCount).toBe(2);
+      expect(settlementsList.textContent).not.toContain('Bo owes Ann: $5.00');
+      expect(settlementsList.textContent).toContain('Ann owes Bo: $15.00');
+
+      const memberCards = document.querySelectorAll('#member-balances-list .balance-card');
+      expect(memberCards.length).toBe(2);
+      expect(memberCards[0].getAttribute('data-net-balance')).toBe('-1500');
+      expect(memberCards[1].getAttribute('data-net-balance')).toBe('1500');
+    });
+  });
+
+
+
   describe('End-to-end integration with Express backend', () => {
     it('supports full group creation and listing flow across backend and client contract', async () => {
       db = createDatabase(':memory:');
@@ -1362,6 +2115,76 @@ describe('Task 11: Group list/create Web UI', () => {
       expect(listRes.body).toHaveLength(1);
       expect(listRes.body[0].description).toBe('Lunch');
       expect(listRes.body[0].paid_by).toBe(member42.id);
+    });
+
+
+    it('supports full group creation, expense addition, balance calculation, and settle-up across API', async () => {
+      db = createDatabase(':memory:');
+      const app = createApp(db);
+
+      // 1. Create a group with 2 members: Alice & Bob
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({
+          name: 'Road Trip',
+          members: ['Alice', 'Bob'],
+        });
+      expect(groupRes.status).toBe(201);
+      const groupId = groupRes.body.id;
+      const aliceId = groupRes.body.members[0].id;
+      const bobId = groupRes.body.members[1].id;
+
+      // 2. Initial balances are zeroed
+      const initialBalRes = await request(app).get(`/groups/${groupId}/balances`);
+      expect(initialBalRes.status).toBe(200);
+      expect(initialBalRes.body.total_spend).toBe(0);
+      expect(initialBalRes.body.settlements).toEqual([]);
+
+      // 3. Alice pays $50.00 (5000 cents) split equally ($25.00 each)
+      const expRes = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 5000,
+          description: 'Gas',
+          paid_by: aliceId,
+        });
+      expect(expRes.status).toBe(201);
+
+      // 4. Balances reflect that Bob owes Alice $25.00 (2500 cents)
+      const afterExpBalRes = await request(app).get(`/groups/${groupId}/balances`);
+      expect(afterExpBalRes.status).toBe(200);
+      expect(afterExpBalRes.body.total_spend).toBe(5000);
+      expect(afterExpBalRes.body.net_balances).toEqual({
+        [String(aliceId)]: 2500,
+        [String(bobId)]: -2500,
+      });
+      expect(afterExpBalRes.body.settlements).toHaveLength(1);
+      expect(afterExpBalRes.body.settlements[0].from).toBe(bobId);
+      expect(afterExpBalRes.body.settlements[0].to).toBe(aliceId);
+      expect(afterExpBalRes.body.settlements[0].amount).toBe(2500);
+
+      // 5. Settle up: Bob pays Alice $25.00
+      const settleRes = await request(app)
+        .post(`/groups/${groupId}/settle`)
+        .send({
+          from: bobId,
+          to: aliceId,
+          amount: 2500,
+          description: 'Gas payback',
+        });
+      expect(settleRes.status).toBe(201);
+      expect(settleRes.body.amount).toBe(2500);
+      expect(settleRes.body.from).toBe(bobId);
+      expect(settleRes.body.to).toBe(aliceId);
+
+      // 6. Balances are now fully settled
+      const afterSettleBalRes = await request(app).get(`/groups/${groupId}/balances`);
+      expect(afterSettleBalRes.status).toBe(200);
+      expect(afterSettleBalRes.body.net_balances).toEqual({
+        [String(aliceId)]: 0,
+        [String(bobId)]: 0,
+      });
+      expect(afterSettleBalRes.body.settlements).toEqual([]);
     });
   });
 });
