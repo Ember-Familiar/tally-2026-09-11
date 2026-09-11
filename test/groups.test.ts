@@ -423,4 +423,394 @@ describe('Group Routes', () => {
       }
     });
   });
+
+  describe('GET /groups/:id/balances (Balances)', () => {
+    it('returns 400 for malformed group id', async () => {
+      const malformedIds = ['abc', '-1', '0', '1.5', 'true', 'null', '999999999999999999999999999'];
+      for (const badId of malformedIds) {
+        const res = await request(app).get(`/groups/${badId}/balances`);
+        expect(res.status).toBe(400);
+        expect(res.body).toEqual({ error: 'Invalid group ID: must be a positive integer' });
+      }
+    });
+
+    it('returns 404 for unknown group id', async () => {
+      const res = await request(app).get('/groups/99999/balances');
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: 'Group not found' });
+    });
+
+    it('returns 200 with zeroed balances for existing group with no expenses', async () => {
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Empty Trip', members: ['Alice', 'Bob'] });
+      const groupId = groupRes.body.id;
+
+      const res = await request(app).get(`/groups/${groupId}/balances`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        balances: [
+          {
+            user_id: 1,
+            userId: 1,
+            name: 'Alice',
+            paid: 0,
+            owed: 0,
+            net_balance: 0,
+            balance: 0,
+          },
+          {
+            user_id: 2,
+            userId: 2,
+            name: 'Bob',
+            paid: 0,
+            owed: 0,
+            net_balance: 0,
+            balance: 0,
+          },
+        ],
+        net_balances: {
+          '1': 0,
+          '2': 0,
+        },
+        settlements: [],
+        pairwise: [],
+        total_spend: 0,
+      });
+    });
+
+    it('returns 200 with exact balances for single expense', async () => {
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Trip', members: ['Alice', 'Bob', 'Charlie'] });
+      const groupId = groupRes.body.id;
+
+      // Alice pays 6000 cents split 3 ways (2000 each)
+      const expRes = await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({
+          amount: 6000,
+          description: 'Cabin',
+          paid_by: 1,
+        });
+      expect(expRes.status).toBe(201);
+
+      const res = await request(app).get(`/groups/${groupId}/balances`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        balances: [
+          {
+            user_id: 1,
+            userId: 1,
+            name: 'Alice',
+            paid: 6000,
+            owed: 2000,
+            net_balance: 4000,
+            balance: 4000,
+          },
+          {
+            user_id: 2,
+            userId: 2,
+            name: 'Bob',
+            paid: 0,
+            owed: 2000,
+            net_balance: -2000,
+            balance: -2000,
+          },
+          {
+            user_id: 3,
+            userId: 3,
+            name: 'Charlie',
+            paid: 0,
+            owed: 2000,
+            net_balance: -2000,
+            balance: -2000,
+          },
+        ],
+        net_balances: {
+          '1': 4000,
+          '2': -2000,
+          '3': -2000,
+        },
+        settlements: [
+          {
+            from: 2,
+            to: 1,
+            from_user_id: 2,
+            to_user_id: 1,
+            from_name: 'Bob',
+            to_name: 'Alice',
+            amount: 2000,
+          },
+          {
+            from: 3,
+            to: 1,
+            from_user_id: 3,
+            to_user_id: 1,
+            from_name: 'Charlie',
+            to_name: 'Alice',
+            amount: 2000,
+          },
+        ],
+        pairwise: [
+          {
+            from: 2,
+            to: 1,
+            from_user_id: 2,
+            to_user_id: 1,
+            from_name: 'Bob',
+            to_name: 'Alice',
+            amount: 2000,
+          },
+          {
+            from: 3,
+            to: 1,
+            from_user_id: 3,
+            to_user_id: 1,
+            from_name: 'Charlie',
+            to_name: 'Alice',
+            amount: 2000,
+          },
+        ],
+        total_spend: 6000,
+      });
+    });
+
+    it('returns 200 with accurate multi-expense balances and deterministic simplification', async () => {
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Road Trip', members: ['Alice', 'Bob', 'Charlie'] });
+      const groupId = groupRes.body.id;
+
+      // Alice (1) pays 6000 (2000 each)
+      await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 6000, description: 'Hotel', paid_by: 1 });
+
+      // Bob (2) pays 3000 (1000 each)
+      await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 3000, description: 'Dinner', paid_by: 2 });
+
+      // Net: Alice +3000, Bob 0, Charlie -3000
+      const res = await request(app).get(`/groups/${groupId}/balances`);
+      expect(res.status).toBe(200);
+      expect(res.body.balances).toEqual([
+        {
+          user_id: 1,
+          userId: 1,
+          name: 'Alice',
+          paid: 6000,
+          owed: 3000,
+          net_balance: 3000,
+          balance: 3000,
+        },
+        {
+          user_id: 2,
+          userId: 2,
+          name: 'Bob',
+          paid: 3000,
+          owed: 3000,
+          net_balance: 0,
+          balance: 0,
+        },
+        {
+          user_id: 3,
+          userId: 3,
+          name: 'Charlie',
+          paid: 0,
+          owed: 3000,
+          net_balance: -3000,
+          balance: -3000,
+        },
+      ]);
+      expect(res.body.net_balances).toEqual({
+        '1': 3000,
+        '2': 0,
+        '3': -3000,
+      });
+      // Charlie settles directly with Alice
+      expect(res.body.settlements).toEqual([
+        {
+          from: 3,
+          to: 1,
+          from_user_id: 3,
+          to_user_id: 1,
+          from_name: 'Charlie',
+          to_name: 'Alice',
+          amount: 3000,
+        },
+      ]);
+      // Pairwise debts:
+      // From Exp 1: Bob owes Alice 2000, Charlie owes Alice 2000
+      // From Exp 2: Alice owes Bob 1000, Charlie owes Bob 1000
+      // Net pairwise: Bob -> Alice: 1000, Charlie -> Alice: 2000, Charlie -> Bob: 1000
+      expect(res.body.pairwise).toEqual([
+        {
+          from: 2,
+          to: 1,
+          from_user_id: 2,
+          to_user_id: 1,
+          from_name: 'Bob',
+          to_name: 'Alice',
+          amount: 1000,
+        },
+        {
+          from: 3,
+          to: 1,
+          from_user_id: 3,
+          to_user_id: 1,
+          from_name: 'Charlie',
+          to_name: 'Alice',
+          amount: 2000,
+        },
+        {
+          from: 3,
+          to: 2,
+          from_user_id: 3,
+          to_user_id: 2,
+          from_name: 'Charlie',
+          to_name: 'Bob',
+          amount: 1000,
+        },
+      ]);
+      expect(res.body.total_spend).toBe(9000);
+    });
+
+    it('preserves integer cents and exact remainder distribution in balances', async () => {
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Odd Split', members: ['Alice', 'Bob', 'Charlie'] });
+      const groupId = groupRes.body.id;
+
+      // 100 cents split 3 ways: Alice (34), Bob (33), Charlie (33)
+      await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 100, description: 'Coffee', paid_by: 1 });
+
+      const res = await request(app).get(`/groups/${groupId}/balances`);
+      expect(res.status).toBe(200);
+      expect(res.body.balances).toEqual([
+        {
+          user_id: 1,
+          userId: 1,
+          name: 'Alice',
+          paid: 100,
+          owed: 34,
+          net_balance: 66,
+          balance: 66,
+        },
+        {
+          user_id: 2,
+          userId: 2,
+          name: 'Bob',
+          paid: 0,
+          owed: 33,
+          net_balance: -33,
+          balance: -33,
+        },
+        {
+          user_id: 3,
+          userId: 3,
+          name: 'Charlie',
+          paid: 0,
+          owed: 33,
+          net_balance: -33,
+          balance: -33,
+        },
+      ]);
+      // Exact zero-sum
+      const sum = res.body.balances.reduce((acc: number, b: { net_balance: number }) => acc + b.net_balance, 0);
+      expect(sum).toBe(0);
+    });
+
+    it('isolates balances between different groups', async () => {
+      const g1Res = await request(app)
+        .post('/groups')
+        .send({ name: 'Group 1', members: ['Alice', 'Bob'] });
+      const g2Res = await request(app)
+        .post('/groups')
+        .send({ name: 'Group 2', members: ['Charlie', 'Dave'] });
+
+      // Expense in Group 1
+      await request(app)
+        .post(`/groups/${g1Res.body.id}/expenses`)
+        .send({ amount: 1000, description: 'Snacks', paid_by: 1 });
+
+      const g1Balances = await request(app).get(`/groups/${g1Res.body.id}/balances`);
+      expect(g1Balances.status).toBe(200);
+      expect(g1Balances.body.total_spend).toBe(1000);
+      expect(g1Balances.body.balances).toHaveLength(2);
+
+      const g2Balances = await request(app).get(`/groups/${g2Res.body.id}/balances`);
+      expect(g2Balances.status).toBe(200);
+      expect(g2Balances.body.total_spend).toBe(0);
+      expect(g2Balances.body.balances).toHaveLength(2);
+      expect(g2Balances.body.balances[0].paid).toBe(0);
+      expect(g2Balances.body.balances[1].paid).toBe(0);
+    });
+
+    it('returns 500 when database contains torn splits (simulating SQLite ON DELETE CASCADE)', async () => {
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Cascade Test', members: ['Alice', 'Bob', 'Charlie'] });
+      const groupId = groupRes.body.id;
+
+      await request(app)
+        .post(`/groups/${groupId}/expenses`)
+        .send({ amount: 3000, description: 'Lunch', paid_by: 1 });
+
+      // Direct SQLite deletion of non-payer user (Charlie = id 3)
+      // expense_splits has ON DELETE CASCADE, so Charlie's split is dropped
+      // Result: expense.amount = 3000, sum(splits) = 2000 -> torn splits!
+      db.prepare('DELETE FROM users WHERE id = 3').run();
+
+      const res = await request(app).get(`/groups/${groupId}/balances`);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({
+        error: expect.stringContaining('Conservation invariant violated'),
+      });
+    });
+
+    it('maintains flat query execution count (no N+1 query loop)', async () => {
+      const groupRes = await request(app)
+        .post('/groups')
+        .send({ name: 'Scale Group', members: ['Alice', 'Bob', 'Charlie'] });
+      const groupId = groupRes.body.id;
+
+      // Add 10 expenses
+      for (let i = 1; i <= 10; i++) {
+        await request(app)
+          .post(`/groups/${groupId}/expenses`)
+          .send({ amount: 300, description: `Expense ${i}`, paid_by: 1 });
+      }
+
+      let queryCount = 0;
+      const stmtProto = Object.getPrototypeOf(db.prepare('SELECT 1')) as {
+        all: (...args: unknown[]) => unknown;
+        get: (...args: unknown[]) => unknown;
+      };
+      const originalAll = stmtProto.all;
+      const originalGet = stmtProto.get;
+
+      stmtProto.all = function (this: unknown, ...args: unknown[]) {
+        queryCount++;
+        return originalAll.apply(this, args);
+      };
+      stmtProto.get = function (this: unknown, ...args: unknown[]) {
+        queryCount++;
+        return originalGet.apply(this, args);
+      };
+
+      try {
+        const res = await request(app).get(`/groups/${groupId}/balances`);
+        expect(res.status).toBe(200);
+        // Expect exactly 4 queries: group existence check, members select, expenses select, splits select
+        expect(queryCount).toBe(4);
+      } finally {
+        stmtProto.all = originalAll;
+        stmtProto.get = originalGet;
+      }
+    });
+  });
 });

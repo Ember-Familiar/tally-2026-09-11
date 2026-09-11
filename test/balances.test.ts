@@ -118,6 +118,27 @@ describe('Balance Engine - Pure integer-cent calculations & debt simplification'
         expect((err as BalanceEngineError).code).toBe('DUPLICATE_SPLIT_USER');
       }
     });
+
+    it('pins processTransactions own DUPLICATE_SPLIT_USER guard directly via calculateUserBalances', () => {
+      const expense: ExpenseInput = {
+        id: 1,
+        paid_by: 1,
+        amount: 1000,
+        splits: [
+          { user_id: 1, amount: 400 },
+          { user_id: 2, amount: 300 },
+          { user_id: 2, amount: 300 }, // Duplicate user 2
+        ],
+      };
+
+      try {
+        calculateUserBalances([expense]);
+        expect.fail('Should have thrown DUPLICATE_SPLIT_USER from processTransactions');
+      } catch (err) {
+        expect(err).toBeInstanceOf(BalanceEngineError);
+        expect((err as BalanceEngineError).code).toBe('DUPLICATE_SPLIT_USER');
+      }
+    });
   });
 
   describe('Carried invariant: exact conservation & split integrity (ON DELETE CASCADE handling)', () => {
@@ -579,6 +600,72 @@ describe('Balance Engine - Pure integer-cent calculations & debt simplification'
       });
     });
 
+    it('pins documented amount DESC sort for debtors and creditors in simplifyDebts', () => {
+      // 1. Debtor amount DESC: debtor 2 (300) must settle before debtor 1 (100)
+      const debtorTestBalances = {
+        1: -100,
+        2: -300,
+        3: 200,
+        4: 200,
+      };
+      const debtorTransfers = simplifyDebts(debtorTestBalances);
+      expect(debtorTransfers).toEqual([
+        {
+          from: 2,
+          to: 3,
+          from_user_id: 2,
+          to_user_id: 3,
+          amount: 200,
+        },
+        {
+          from: 2,
+          to: 4,
+          from_user_id: 2,
+          to_user_id: 4,
+          amount: 100,
+        },
+        {
+          from: 1,
+          to: 4,
+          from_user_id: 1,
+          to_user_id: 4,
+          amount: 100,
+        },
+      ]);
+
+      // 2. Creditor amount DESC: creditor 4 (300) must settle before creditor 3 (100)
+      const creditorTestBalances = {
+        1: -200,
+        2: -200,
+        3: 100,
+        4: 300,
+      };
+      const creditorTransfers = simplifyDebts(creditorTestBalances);
+      expect(creditorTransfers).toEqual([
+        {
+          from: 1,
+          to: 4,
+          from_user_id: 1,
+          to_user_id: 4,
+          amount: 200,
+        },
+        {
+          from: 2,
+          to: 4,
+          from_user_id: 2,
+          to_user_id: 4,
+          amount: 100,
+        },
+        {
+          from: 2,
+          to: 3,
+          from_user_id: 2,
+          to_user_id: 3,
+          amount: 100,
+        },
+      ]);
+    });
+
     it('guarantees transfer amounts are strictly positive safe integers', () => {
       const netBalances = {
         1: 7000,
@@ -848,6 +935,41 @@ describe('Balance Engine - Pure integer-cent calculations & debt simplification'
           from_user_id: 2,
           to_user_id: 1,
           amount: 600, // 1000 - 400
+        },
+      ]);
+    });
+
+    it('correctly nets pairwise debts when smaller bucket is inserted first (net < 0 branch)', () => {
+      // u1 pays 100 split 50/50, then u2 pays 300 split 150/150: correct output is 1->2: 100
+      const expenses: ExpenseInput[] = [
+        {
+          id: 1,
+          paid_by: 1,
+          amount: 100,
+          splits: [
+            { user_id: 1, amount: 50 },
+            { user_id: 2, amount: 50 },
+          ],
+        },
+        {
+          id: 2,
+          paid_by: 2,
+          amount: 300,
+          splits: [
+            { user_id: 1, amount: 150 },
+            { user_id: 2, amount: 150 },
+          ],
+        },
+      ];
+
+      const pairwise = calculatePairwiseDebts(expenses);
+      expect(pairwise).toEqual([
+        {
+          from: 1,
+          to: 2,
+          from_user_id: 1,
+          to_user_id: 2,
+          amount: 100,
         },
       ]);
     });

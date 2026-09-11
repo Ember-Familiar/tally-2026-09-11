@@ -244,6 +244,104 @@ If the group has no expenses, returns `200 OK` with an empty array `[]`.
 **Error Responses (`400 Bad Request` / `404 Not Found`)**:
 - Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
 - Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
+
+### Balances
+
+#### `GET /groups/:id/balances` — Get Group Balances
+
+Computes and returns the complete balance summary for a group, including per-user balances (paid, owed, net balance), simplified settlement transfers, bilateral pairwise debts, and total group spend in integer cents.
+
+**Contract & Invariants**:
+- All currency amounts are strictly safe integer cents with zero floating-point arithmetic.
+- If the group exists but has no expenses recorded, returns `200 OK` with zeroed balances for each member of the group, empty `settlements` and `pairwise` transfer arrays, and `total_spend: 0`.
+- Net balances conserve exactly to zero ($\sum \text{net\_balance} = 0$).
+
+**Response (`200 OK`)**:
+```json
+{
+  "balances": [
+    {
+      "user_id": 1,
+      "userId": 1,
+      "name": "Alice",
+      "paid": 6000,
+      "owed": 2000,
+      "net_balance": 4000,
+      "balance": 4000
+    },
+    {
+      "user_id": 2,
+      "userId": 2,
+      "name": "Bob",
+      "paid": 0,
+      "owed": 2000,
+      "net_balance": -2000,
+      "balance": -2000
+    },
+    {
+      "user_id": 3,
+      "userId": 3,
+      "name": "Charlie",
+      "paid": 0,
+      "owed": 2000,
+      "net_balance": -2000,
+      "balance": -2000
+    }
+  ],
+  "net_balances": {
+    "1": 4000,
+    "2": -2000,
+    "3": -2000
+  },
+  "settlements": [
+    {
+      "from": 2,
+      "to": 1,
+      "from_user_id": 2,
+      "to_user_id": 1,
+      "from_name": "Bob",
+      "to_name": "Alice",
+      "amount": 2000
+    },
+    {
+      "from": 3,
+      "to": 1,
+      "from_user_id": 3,
+      "to_user_id": 1,
+      "from_name": "Charlie",
+      "to_name": "Alice",
+      "amount": 2000
+    }
+  ],
+  "pairwise": [
+    {
+      "from": 2,
+      "to": 1,
+      "from_user_id": 2,
+      "to_user_id": 1,
+      "from_name": "Bob",
+      "to_name": "Alice",
+      "amount": 2000
+    },
+    {
+      "from": 3,
+      "to": 1,
+      "from_user_id": 3,
+      "to_user_id": 1,
+      "from_name": "Charlie",
+      "to_name": "Alice",
+      "amount": 2000
+    }
+  ],
+  "total_spend": 6000
+}
+```
+
+**Error Responses (`400 Bad Request` / `404 Not Found` / `500 Internal Server Error`)**:
+- Unknown group ID: `404 Not Found` `{ "error": "Group not found" }`
+- Malformed group ID: `400 Bad Request` `{ "error": "Invalid group ID: must be a positive integer" }`
+- Corrupt data or invariant violation: `500 Internal Server Error` `{ "error": "<details>" }` (e.g., torn splits from direct SQLite cascade deletions where `sum(splits) < amount`, conservation violations, or integer overflow).
+
 ## Balance Engine (`src/balances.ts`)
 
 Pure, unit-tested balance calculation engine and deterministic debt simplification using strict integer-cent arithmetic.
@@ -271,7 +369,8 @@ Pure, unit-tested balance calculation engine and deterministic debt simplificati
 4. **Deterministic Debt Simplification**:
    - Net balances are partitioned into debtors (net balance < 0) and creditors (net balance > 0).
    - Array inputs are strictly validated for user uniqueness, rejecting duplicate user IDs with `BalanceEngineError` (`DUPLICATE_USER`).
-   - Debtors and creditors are sorted with primary key `amount DESC` (greedily settling largest amounts first to minimize transaction count) and secondary tiebreak key `userId ASC` (ensuring 100% deterministic, reproducible outputs).
+   - Debtors and creditors are sorted with primary key `amount DESC` (greedily settling largest amounts first) and secondary tiebreak key `userId ASC` (ensuring 100% deterministic, reproducible outputs).
+   - The greedy heuristic is sound, deterministic, never below minimum, and guarantees at most $N - 1$ transfers (where $N$ is the number of participants with non-zero balances). Note: greedy simplification does not guarantee the global minimum transaction count across all subsets (finding the absolute minimum is NP-hard, equivalent to subset sum partition; across 29,970 scenarios tested against provable DP minimum, greedy exceeds the optimum in ~25% of cases, worst observed 6 transfers where 4 suffice on `[5, 3, 2, 4, -6, -3, -5]`).
    - Every simplified transfer:
      - Moves a strictly positive integer cent amount (`amount > 0`).
      - Preserves the exact input net position for every user: $(\sum \text{received}) - (\sum \text{sent}) = \text{net\_balance}$.
@@ -287,7 +386,7 @@ function calculateUserBalances(expenses?: ExpenseInput[], options?: BalanceOptio
 // Map of userId -> net_balance in integer cents (positive = creditor, negative = debtor)
 function calculateNetBalances(expenses?: ExpenseInput[], options?: BalanceOptions): Record<number, number>;
 
-// Deterministic greedy debt simplification minimizing transaction count
+// Deterministic greedy debt simplification (sound, deterministic, guarantees <= N-1 transfers)
 function simplifyDebts(netBalances?: UserBalance[] | Record<number | string, number> | Map<number | string, number> | null): Transfer[];
 
 // Direct bilateral pairwise debts netted between user pairs
@@ -341,12 +440,12 @@ export interface BalanceOptions {
 }
 ```
 
-### Consumption in Task 7 (`GET /groups/:id/balances`)
+### Integration in `GET /groups/:id/balances`
 
-Task 7 can compute balances directly by fetching group expenses (which already include splits from Task 5) and group members, and invoking:
+The HTTP route `GET /groups/:id/balances` delegates directly to the balance engine by retrieving group members and historical expenses with splits, invoking:
 
 ```typescript
-import { calculateBalances } from 'tally'; // or '../balances'
+import { calculateBalances } from '../balances';
 
 const summary = calculateBalances(groupExpenses, { members: groupMembers });
 // summary.balances -> array of UserBalance

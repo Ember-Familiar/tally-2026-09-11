@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import Database from 'better-sqlite3';
+import { calculateBalances, BalanceEngineError } from '../balances';
 
 export interface Member {
   id: number;
@@ -634,6 +635,36 @@ export function createGroupRouter(db: Database.Database): Router {
       const expenses = getGroupExpensesWithSplits(groupId);
       res.status(200).json(expenses);
     } catch (err) {
+      next(err);
+    }
+  });
+
+  // GET /groups/:id/balances - Get group balance summary
+  router.get('/:id/balances', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const rawId = req.params.id;
+      const groupId = parseId(rawId);
+      if (groupId === null) {
+        res.status(400).json({ error: 'Invalid group ID: must be a positive integer' });
+        return;
+      }
+
+      const group = selectGroupById.get(groupId);
+      if (!group) {
+        res.status(404).json({ error: 'Group not found' });
+        return;
+      }
+
+      const members = selectGroupMembers.all(groupId) as Member[];
+      const fullExpenses = getGroupExpensesWithSplits(groupId);
+
+      const summary = calculateBalances(fullExpenses, { members });
+      res.status(200).json(summary);
+    } catch (err) {
+      if (err instanceof BalanceEngineError) {
+        res.status(500).json({ error: err.message });
+        return;
+      }
       next(err);
     }
   });
