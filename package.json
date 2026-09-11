@@ -8,10 +8,12 @@
   },
   "scripts": {
     "build": "tsc",
+    "premigrate": "npm run build",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
     "migrate": "node dist/migrate.js",
+    "prestart": "npm run build",
     "start": "node dist/server.js"
   },
   "dependencies": {
