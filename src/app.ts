@@ -1,5 +1,7 @@
 import express, { Express, NextFunction, Request, Response } from 'express';
 import Database from 'better-sqlite3';
+import path from 'path';
+import fs from 'fs';
 import { createDatabase } from './db';
 import { createGroupRouter } from './routes/groups';
 
@@ -28,12 +30,38 @@ export function createApp(db?: Database.Database): Express {
 
   app.use(express.json());
 
+  // Serve static UI assets from public directory (resolved relative to module location)
+  const publicDir = path.resolve(__dirname, '../public');
+  if (fs.existsSync(publicDir)) {
+    app.use(express.static(publicDir, { index: false }));
+  } else {
+    console.warn(`[tally] public/ directory not found at ${publicDir}; UI static asset serving disabled.`);
+  }
+
   const healthHandler = (_req: Request, res: Response): void => {
     res.status(200).json({ status: 'ok' });
   };
 
   app.get('/health', healthHandler);
   app.get('/api/health', healthHandler);
+
+  // Root endpoint: serve UI HTML when HTML requested, or JSON info for API clients
+  app.get('/', (req: Request, res: Response) => {
+    if (req.headers.accept && req.headers.accept.includes('text/html')) {
+      const indexPath = path.join(publicDir, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        res.sendFile('index.html', { root: publicDir });
+        return;
+      }
+    }
+
+    res.status(200).json({
+      name: 'tally',
+      description: 'Expense-splitting web app',
+      version: '0.1.0',
+      status: 'ok',
+    });
+  });
 
   app.use('/groups', createGroupRouter(database));
 
