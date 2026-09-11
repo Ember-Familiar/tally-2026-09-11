@@ -105,6 +105,33 @@ describe('Group Routes', () => {
       expect(allUsers).toHaveLength(3);
     });
 
+    it('reuses existing users by name case-insensitively', async () => {
+      // First group creates Alice
+      const res1 = await request(app)
+        .post('/groups')
+        .send({
+          name: 'Group 1',
+          members: ['Alice'],
+        });
+      expect(res1.status).toBe(201);
+      expect(res1.body.members).toEqual([{ id: 1, name: 'Alice' }]);
+
+      // Second group uses 'alice' in lowercase, which should reuse Alice (id: 1)
+      const res2 = await request(app)
+        .post('/groups')
+        .send({
+          name: 'Group 2',
+          members: ['alice'],
+        });
+      expect(res2.status).toBe(201);
+      expect(res2.body.members).toEqual([{ id: 1, name: 'Alice' }]);
+
+      // Verify that no duplicate user row was created
+      const allUsers = db.prepare('SELECT id, name FROM users ORDER BY id ASC').all() as { id: number; name: string }[];
+      expect(allUsers).toHaveLength(1);
+      expect(allUsers[0]).toEqual({ id: 1, name: 'Alice' });
+    });
+
     it('creates a group using member objects and existing user IDs', async () => {
       // Pre-seed a user
       db.prepare('INSERT INTO users (name) VALUES (?)').run('Existing User');

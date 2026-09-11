@@ -118,3 +118,75 @@ Returns a single group with its members by group ID.
 **Error Responses**:
 - `404 Not Found`: `{ "error": "Group not found" }` when the group ID does not exist.
 - `400 Bad Request`: `{ "error": "Invalid group ID: must be a positive integer" }` when `:id` is not a positive integer (e.g., `/groups/abc`, `/groups/-1`, `/groups/0`).
+
+### Expenses
+
+#### `POST /groups/:id/expenses` — Create an Expense with Equal Split
+
+Creates an expense for a group with an exact integer-cent equal split among all group members in a single atomic SQLite transaction across `expenses` and `expense_splits`.
+
+**Arithmetic & Remainder Distribution**:
+- All amounts (`amount` on expenses and `amount` on splits) are stored as integer cents.
+- Given an expense of `total` cents and `N` group members ordered by `user_id ASC`:
+  - `base = Math.floor(total / N)`
+  - `remainder = total % N`
+  - The first `remainder` members by `user_id ASC` each absorb one extra cent (`base + 1`); the remaining members absorb `base` cents.
+  - Split amounts sum exactly to `total` for every input (including `1000 / 3` → `334, 333, 333` and `1 / 3` → `1, 0, 0`).
+
+**Payer Contract**:
+- Payer can be specified via `paid_by` (or `payer_id`), as a user ID (positive integer), user name (string, matched case-insensitively), or object (`{ id }` or `{ name }`).
+- The payer must be an existing member of the group. A non-member payer is rejected with `400 Bad Request`.
+
+**Date Validation**:
+- `date` is optional. If provided, it must be a valid timestamp in `YYYY-MM-DD HH:MM:SS` format.
+- Bare `'now'`, non-standard formats (e.g. ISO 8601 with `T`), and invalid calendar dates (e.g. `2026-02-30 00:00:00`, `2026-09-05 24:00:00`) are rejected with `400 Bad Request`.
+- If omitted, `date` defaults to SQLite's `CURRENT_TIMESTAMP`.
+
+**Request Body**:
+```json
+{
+  "amount": 6000,
+  "description": "Groceries",
+  "paid_by": 1,
+  "date": "2026-09-11 19:00:00"
+}
+```
+
+**Response (`201 Created`)**:
+```json
+{
+  "id": 1,
+  "group_id": 1,
+  "paid_by": 1,
+  "amount": 6000,
+  "description": "Groceries",
+  "date": "2026-09-11 19:00:00",
+  "created_at": "2026-09-11 19:00:00",
+  "splits": [
+    {
+      "id": 1,
+      "expense_id": 1,
+      "user_id": 1,
+      "user_name": "Alice",
+      "amount": 2000,
+      "created_at": "2026-09-11 19:00:00"
+    },
+    {
+      "id": 2,
+      "expense_id": 1,
+      "user_id": 2,
+      "user_name": "Bob",
+      "amount": 2000,
+      "created_at": "2026-09-11 19:00:00"
+    },
+    {
+      "id": 3,
+      "expense_id": 1,
+      "user_id": 3,
+      "user_name": "Charlie",
+      "amount": 2000,
+      "created_at": "2026-09-11 19:00:00"
+    }
+  ]
+}
+```
