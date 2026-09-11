@@ -74,6 +74,102 @@
         <div id="groups-status-container"></div>
         <div id="groups-list" class="groups-grid" aria-live="polite"></div>
       </section>
+
+      <!-- Group Expenses Section -->
+      <section class="card" id="expenses-section">
+        <div class="card-header-actions">
+          <div>
+            <h2 class="card-title" id="expenses-title">Group Expenses</h2>
+            <p class="card-subtitle" id="expenses-subtitle">Add and view expenses for your groups.</p>
+          </div>
+          <button type="button" id="refresh-expenses-btn" class="btn btn-secondary btn-sm" title="Refresh expenses list">
+            🔄 Refresh
+          </button>
+        </div>
+
+        <!-- Add Expense Form -->
+        <form id="add-expense-form" class="form" novalidate>
+          <div class="form-group">
+            <label for="expense-group" class="form-label">Group <span class="required">*</span></label>
+            <select id="expense-group" name="groupId" class="form-input" required>
+              <option value="">-- Select a group --</option>
+            </select>
+            <span class="form-hint">Choose which group to add this expense to.</span>
+          </div>
+
+          <div class="form-group">
+            <label for="expense-description" class="form-label">Description</label>
+            <input
+              type="text"
+              id="expense-description"
+              name="description"
+              class="form-input"
+              placeholder="e.g. Groceries, Dinner, Gas"
+              maxlength="255"
+            >
+          </div>
+
+          <div class="form-row">
+            <div class="form-group form-col">
+              <label for="expense-amount" class="form-label">Amount (cents) <span class="required">*</span></label>
+              <input
+                type="number"
+                id="expense-amount"
+                name="amount"
+                class="form-input"
+                placeholder="e.g. 2500 for $25.00"
+                min="1"
+                step="1"
+                required
+              >
+              <span class="form-hint">Enter integer cents (e.g. 1000 = $10.00).</span>
+            </div>
+
+            <div class="form-group form-col">
+              <label for="expense-payer" class="form-label">Paid By <span class="required">*</span></label>
+              <input
+                type="text"
+                id="expense-payer"
+                name="paid_by"
+                class="form-input"
+                placeholder="Member name or ID (e.g. Alice)"
+                required
+              >
+              <span class="form-hint">Must be an existing member of the group.</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="expense-date" class="form-label">Date</label>
+            <input
+              type="text"
+              id="expense-date"
+              name="date"
+              class="form-input"
+              placeholder="YYYY-MM-DD HH:MM:SS (optional, defaults to now)"
+            >
+            <span class="form-hint">Format: YYYY-MM-DD HH:MM:SS (leave blank for current time).</span>
+          </div>
+
+          <div id="expense-feedback" class="feedback-message hidden" role="alert"></div>
+
+          <div class="form-actions">
+            <button type="submit" id="add-expense-btn" class="btn btn-primary">
+              <span class="btn-text">Add Expense</span>
+            </button>
+          </div>
+        </form>
+
+        <hr class="section-divider">
+
+        <!-- Expense History -->
+        <div class="expenses-list-header">
+          <h3 class="subsection-title">Expense History</h3>
+        </div>
+
+        <div id="expenses-status-container"></div>
+        <div id="expenses-list" class="expenses-grid" aria-live="polite"></div>
+      </section>
     </main>
 
     <footer class="app-footer">

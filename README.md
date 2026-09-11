@@ -30,6 +30,13 @@ This starts the server on port 3000 by default (`node dist/server.js`), using th
 
 Tally includes a browser interface served at `/` when navigating with a web browser (or requesting `Accept: text/html`). Static assets (`index.html`, `style.css`, `app.js`) reside in the root `public/` directory and are served by the Express backend.
 
+The interface provides:
+- **Group Management**: Create new groups with initial members and view all existing groups with member badges and creation dates.
+- **Add-Expense Form**: Record new shared expenses against `POST /groups/:id/expenses` with description, integer-cent amount, payer (name or ID), and optional custom timestamp, split equally across group members.
+- **Expense History**: View recorded expenses for any group via `GET /groups/:id/expenses` ordered newest expense date first (`date DESC, id DESC`), complete with formatted dollar amounts, payer information, date, and individual split allocations.
+- **Feedback & Validation**: Inline feedback banners for success notifications and server-rejected validation error messages (e.g. missing amount, non-member payer, invalid dates).
+- **Safe DOM Discipline**: All dynamic UI nodes are generated using safe DOM primitives (`document.createElement`, `element.textContent`, `element.appendChild`, `element.replaceChildren`), strictly forbidding unsafe sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`) to guarantee complete immunity from script/markup injection.
+
 ## API Endpoints
 
 ### Health Checks
